@@ -65,11 +65,11 @@ ALPHA_LR = 3e-4      # Temperature learning rate
 
 GAMMA = 0.99         # Discount factor (importance of future rewards)
 TAU = 0.005          # Target network soft-update rate. How fast the target critics track the main critics (0.005 - stable, 0.01 - tracks faster)
-BATCH_SIZE = 2048    # [512 - 4096] MAXIMIZED FOR RTX 3060: Large batches = maximum GPU utilization (12GB VRAM can handle 2048 easily)
-REPLAY_CAPACITY = 1_000_000 # [500k - 2M] Max transitions stored in replay buffer, Larger = more diverse data (optimized for GPU)
-WARMUP_STEPS = 10_000 # Number of env steps collected before any learning (enough to fill replay buffer with large batches)
+BATCH_SIZE = 1024    # [512 - 2048] OPTIMIZED FOR RTX 3060: Reduced from 2048 to avoid OOM, still large enough for good GPU utilization
+REPLAY_CAPACITY = 500_000 # [500k - 1M] Max transitions stored in replay buffer (reduced to save memory)
+WARMUP_STEPS = 5_000 # Number of env steps collected before any learning (enough to fill replay buffer)
 STEPS_PER_UPDATE = 1 # Do updates every N environment steps (OPTIMIZED: update every step for maximum GPU usage)
-UPDATES_PER_STEP = 16 # Number of gradient updates per trigger (MAXIMIZED: many updates to fully saturate GPU, RTX 3060 can handle this)
+UPDATES_PER_STEP = 8 # Number of gradient updates per trigger (REDUCED: 8 updates to avoid OOM, still keeps GPU busy)
 TARGET_ENTROPY = None  # None => will set -action_dim below (-2 for 2D action) (more negative - stronger exploration)
 AUTOMATIC_ENTROPY_TUNING = True # If True, learn temperature α to match TARGET_ENTROPY. (Leave True)
 
@@ -82,10 +82,10 @@ RENDER_EVERY = 0  # 0 disables auto-render - THIS IS KEY FOR SPEED!
 # ============================================================================
 
 # Encodes the observation grid (channels × H × W) and concatenates the 2-D pen vector; outputs a feature vector.
-# hidden_dim: Size of the MLP output. Higher = more capacity, slower. MAXIMIZED: 1024 for RTX 3060 to use full GPU capacity
+# hidden_dim: Size of the MLP output. Higher = more capacity, slower. OPTIMIZED: 768 for RTX 3060 to balance memory and performance
 class CNNFeature(nn.Module):
-    """CNN feature extractor for grid observations - MAXIMIZED for RTX 3060 GPU utilization."""
-    def __init__(self, observation_shape, pen_vec_dim=2, hidden_dim=1024):
+    """CNN feature extractor for grid observations - OPTIMIZED for RTX 3060 GPU utilization."""
+    def __init__(self, observation_shape, pen_vec_dim=2, hidden_dim=768):
         super().__init__()
         channels, height, width = observation_shape
         # Improved CNN with better spatial reduction
@@ -410,8 +410,15 @@ class SACAgent(BaseAgent):
 
         # Begin SGD only after warmup, and not every step (decouples FPS from SGD)
         if self.replay.size >= self.learning_starts and (self.total_steps % self.update_every == 0):
+            # OPTIMIZATION: Clear cache before updates to free memory
+            if self.device == 'cuda':
+                torch.cuda.empty_cache()
             for _ in range(self.max_updates_per_step):
                 self._update()
+                # OPTIMIZATION: Clear cache periodically during updates to avoid OOM
+                # Uncomment if you still get OOM errors:
+                # if self.device == 'cuda' and _ % 4 == 0:
+                #     torch.cuda.empty_cache()
 
     def _update(self):
         """Optimized update with fused operations and better GPU utilization."""
@@ -419,7 +426,12 @@ class SACAgent(BaseAgent):
         if not self.actor.training:
             self.actor.train()
         
+        # OPTIMIZATION: Sample batch and ensure it's on GPU
         obs, pen, act, rew, next_obs, next_pen, done = self.replay.sample(self.batch_size)
+        
+        # OPTIMIZATION: Clear intermediate cache before compute
+        if self.device == 'cuda':
+            torch.cuda.empty_cache()
 
         # ----- Critic update (with AMP when CUDA) -----
         # OPTIMIZATION: Use float16 for faster computation on modern GPUs
@@ -441,12 +453,12 @@ class SACAgent(BaseAgent):
             self.critic_scaler.scale(critic_loss).backward()
             # OPTIMIZATION: Unscale before gradient clipping for numerical stability
             self.critic_scaler.unscale_(self.critic_opt)
-            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 10.0)  # Higher clip for stability with large batches
+            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)  # Standard clip for stability
             self.critic_scaler.step(self.critic_opt)
             self.critic_scaler.update()
         else:
             critic_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 10.0)
+            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
             self.critic_opt.step()
 
         # ----- Actor update (with AMP) -----
@@ -460,12 +472,12 @@ class SACAgent(BaseAgent):
         if self.actor_scaler is not None:
             self.actor_scaler.scale(actor_loss).backward()
             self.actor_scaler.unscale_(self.actor_opt)
-            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 10.0)  # Higher clip for stability
+            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)  # Standard clip for stability
             self.actor_scaler.step(self.actor_opt)
             self.actor_scaler.update()
         else:
             actor_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 10.0)
+            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
             self.actor_opt.step()
 
         # ----- Temperature (alpha) update -----
@@ -962,12 +974,12 @@ def train(
         gamma=GAMMA,
         tau=TAU,
         lr=ACTOR_LR,
-        hidden_dim=1024,  # MAXIMIZED: Large network to fully utilize RTX 3060 GPU (12GB VRAM can handle 1024 easily)
+        hidden_dim=768,  # OPTIMIZED: Balanced network size to avoid OOM while maintaining good performance
         buffer_capacity=REPLAY_CAPACITY,
         batch_size=BATCH_SIZE,
         updates_per_step=1,          # kept for compatibility
         update_every=STEPS_PER_UPDATE,  # train every N steps
-        max_updates_per_step=UPDATES_PER_STEP,  # MAXIMIZED: 16 updates to saturate GPU with large batches
+        max_updates_per_step=UPDATES_PER_STEP,  # OPTIMIZED: 8 updates to avoid OOM while keeping GPU busy
         learning_starts=WARMUP_STEPS,  # start learning after warmup
         automatic_entropy_tuning=AUTOMATIC_ENTROPY_TUNING,
         pen_vec_dim=2
