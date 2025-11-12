@@ -1,0 +1,10 @@
+--index-url https://download.pytorch.org/whl/cu124
+--extra-index-url https://pypi.org/simple
+
+pygame
+numpy
+pillow
+scipy
+pyyaml
+matplotlib
+torch==2.6.0

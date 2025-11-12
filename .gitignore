@@ -1,0 +1,176 @@
+# Sheep Herding RL - Git Ignore
+
+# ============================================================================
+# Training Checkpoints & Saves (IMPORTANT!)
+# ============================================================================
+saves/
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.pkl
+*.pickle
+
+# Logs
+logs/
+*.log
+wandb/
+tensorboard_logs/
+
+# ============================================================================
+# Python
+# ============================================================================
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# pyenv
+.python-version
+
+# ============================================================================
+# IDE & Editors
+# ============================================================================
+# VSCode
+.vscode/
+*.code-workspace
+
+# PyCharm
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+*.swp
+*.swo
+*~
+
+# Emacs
+*~
+\#*\#
+.\#*
+
+# ============================================================================
+# Operating System
+# ============================================================================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# Linux
+*~
+.directory
+.Trash-*
+
+# ============================================================================
+# Project Specific
+# ============================================================================
+# Temporary files
+temp/
+tmp/
+*.tmp
+
+# Videos/Recordings (optional - comment out if you want to track them)
+videos/
+recordings/
+*.mp4
+*.avi
+*.gif
+
+# Data files (if you have large datasets)
+data/
+datasets/
+
+# Backup files
+*.bak
+*.backup
+*_backup.*
+
+# Debug files
+debug/
+*.debug
+
+# ============================================================================
+# Documentation (optional - keep these if you want)
+# ============================================================================
+# Uncomment if you don't want to track generated docs
+# docs/_build/
+# site/
+
+# ============================================================================
+# Misc
+# ============================================================================
+.env
+.env.local
+*.orig
+*.rej
+
