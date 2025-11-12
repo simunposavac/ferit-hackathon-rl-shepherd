@@ -229,13 +229,14 @@ class ReplayBuffer:
         
         # OPTIMIZATION: Transfer only the sampled batch to GPU (not entire buffer)
         # This is memory efficient - buffer stays on CPU, only small batches go to GPU
-        obs = torch.from_numpy(self.obs_buf[idxs]).to(self.device)
-        pen = torch.from_numpy(self.pen_buf[idxs]).to(self.device)
-        act = torch.from_numpy(self.act_buf[idxs]).to(self.device)
-        rew = torch.from_numpy(self.rew_buf[idxs]).to(self.device)
-        next_obs = torch.from_numpy(self.next_obs_buf[idxs]).to(self.device)
-        next_pen = torch.from_numpy(self.next_pen_buf[idxs]).to(self.device)
-        done = torch.from_numpy(self.done_buf[idxs]).to(self.device)
+        # Use from_numpy() for efficient conversion (shares memory if possible)
+        obs = torch.from_numpy(self.obs_buf[idxs]).to(self.device, non_blocking=True)
+        pen = torch.from_numpy(self.pen_buf[idxs]).to(self.device, non_blocking=True)
+        act = torch.from_numpy(self.act_buf[idxs]).to(self.device, non_blocking=True)
+        rew = torch.from_numpy(self.rew_buf[idxs]).to(self.device, non_blocking=True)
+        next_obs = torch.from_numpy(self.next_obs_buf[idxs]).to(self.device, non_blocking=True)
+        next_pen = torch.from_numpy(self.next_pen_buf[idxs]).to(self.device, non_blocking=True)
+        done = torch.from_numpy(self.done_buf[idxs]).to(self.device, non_blocking=True)
         
         return obs, pen, act, rew, next_obs, next_pen, done
 
@@ -346,10 +347,10 @@ class SACAgent(BaseAgent):
 
     def _to_tensor_inputs(self, observation: np.ndarray, pen_vector: np.ndarray):
         """Optimized tensor conversion with non-blocking transfers for CUDA."""
-        # OPTIMIZATION: Use pin_memory for faster CPU->GPU transfers on CUDA
-        pin_memory = (self.device == 'cuda')
-        obs_grid = torch.as_tensor(observation, dtype=torch.float32, device=self.device, pin_memory=pin_memory).unsqueeze(0)
-        pen_vec = torch.as_tensor(pen_vector, dtype=torch.float32, device=self.device, pin_memory=pin_memory).unsqueeze(0)
+        # OPTIMIZATION: Use from_numpy for efficient conversion, non_blocking for async transfer
+        # torch.as_tensor() doesn't support pin_memory, so we use from_numpy() + to() with non_blocking
+        obs_grid = torch.from_numpy(observation).float().unsqueeze(0).to(self.device, non_blocking=True)
+        pen_vec = torch.from_numpy(pen_vector).float().unsqueeze(0).to(self.device, non_blocking=True)
         return obs_grid, pen_vec
 
     def act(self, observation: np.ndarray, pen_vector: np.ndarray):
