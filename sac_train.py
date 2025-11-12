@@ -570,106 +570,287 @@ class SACAgent(BaseAgent):
 # ----------------------------------------------------------------------------
 
 def dog_reward_fn(info: Dict[str, any], prev_info: Dict[str, any]=None) -> float:
+    """
+    Reward function for the dog agent.
+    Mission: Get sheep into pen and protect them from wolf (can eat wolf).
+    
+    Sparse rewards:
+    - +200 per sheep entering pen (primary objective)
+    - -150 per sheep eaten by wolf (major failure)
+    - +100 for killing wolf (eliminates threat)
+    
+    Dense shaping rewards:
+    - Progress reward: sheep moving toward pen (scaled by distance)
+    - Herding reward: staying near sheep cluster (optimal distance)
+    - Protective reward: positioning between wolf and sheep
+    - Directional reward: pushing sheep toward pen entrance
+    - Proximity to pen: reward when sheep are closer to pen
+    """
     reward = 0.0
 
-    # Main objectives (sparse rewards)
+    # ========================================================================
+    # SPARSE REWARDS (Main objectives)
+    # ========================================================================
     sheep_entered = info.get("sheep_entered_pen", 0)
     sheep_eaten = info.get("sheep_eaten", 0)
     wolf_killed = info.get("wolf_killed", False)
     
-    # Big rewards/penalties for main events
-    reward += float(sheep_entered) * 150.0  # Major reward for saving sheep
-    reward -= float(sheep_eaten) * 120.0     # Major penalty when wolf eats sheep
-    reward += float(wolf_killed) * 80.0      # Bonus for killing wolf
+    reward += float(sheep_entered) * 200.0  # Major reward for saving sheep
+    reward -= float(sheep_eaten) * 150.0     # Major penalty when wolf eats sheep
+    reward += float(wolf_killed) * 100.0     # Bonus for killing wolf (eliminates threat)
     
-    # Dense shaping rewards (help learning when sparse rewards are rare)
+    # ========================================================================
+    # DENSE SHAPING REWARDS (Help learning when sparse rewards are rare)
+    # ========================================================================
     sheep_positions = info.get("sheep_positions", None)
     dog_pos = info.get("dog_position", None)
     wolf_pos = info.get("wolf_position", None)
     pen_center = info.get("pen_center", None)
+    pen_entrance = info.get("pen_entrance_position", None)
     
     if sheep_positions is not None and len(sheep_positions) > 0 and dog_pos is not None and pen_center is not None:
-        # Reward for being near sheep (herding behavior)
-        sheep_dists = np.linalg.norm(sheep_positions - dog_pos, axis=1)
-        avg_sheep_dist = float(np.mean(sheep_dists))
-        min_sheep_dist = float(np.min(sheep_dists))
+        sheep_positions = np.array(sheep_positions)
+        dog_pos = np.array(dog_pos)
+        pen_center = np.array(pen_center)
+        screen_width = config.SCREEN_WIDTH  # Define once at the start
         
-        # Small reward for staying close to sheep cluster
-        reward += (1.0 - min(avg_sheep_dist / 400.0, 1.0)) * 0.15
+        # Calculate distances
+        sheep_dists_to_dog = np.linalg.norm(sheep_positions - dog_pos, axis=1)
+        sheep_dists_to_pen = np.linalg.norm(sheep_positions - pen_center, axis=1)
+        avg_sheep_dist_to_dog = float(np.mean(sheep_dists_to_dog))
+        avg_sheep_dist_to_pen = float(np.mean(sheep_dists_to_pen))
+        min_sheep_dist_to_dog = float(np.min(sheep_dists_to_dog))
         
-        # Reward for sheep moving toward pen (progress-based shaping)
+        # 1. PROGRESS REWARD: Reward sheep moving toward pen (stronger when closer)
         if prev_info is not None:
             prev_sheep_pos = prev_info.get("sheep_positions", None)
             if prev_sheep_pos is not None and len(prev_sheep_pos) == len(sheep_positions):
+                prev_sheep_pos = np.array(prev_sheep_pos)
                 prev_dists_to_pen = np.linalg.norm(prev_sheep_pos - pen_center, axis=1)
-                curr_dists_to_pen = np.linalg.norm(sheep_positions - pen_center, axis=1)
-                progress = float(np.mean(prev_dists_to_pen - curr_dists_to_pen))
-                reward += progress * 0.08  # Reward progress toward pen
+                progress = prev_dists_to_pen - sheep_dists_to_pen
+                avg_progress = float(np.mean(progress))
+                
+                # Scale progress reward: more reward when sheep are closer to pen
+                # (encourages finishing the job)
+                progress_scale = 1.0 + (1.0 - min(avg_sheep_dist_to_pen / 600.0, 1.0))
+                reward += avg_progress * 0.15 * progress_scale
         
-        # Bonus for positioning between wolf and sheep (protective behavior)
+        # 2. HERDING REWARD: Optimal distance to sheep cluster (not too close, not too far)
+        # Optimal distance is around 150-200 pixels (allows dog to guide sheep)
+        optimal_herding_dist = 175.0
+        herding_dist_diff = abs(avg_sheep_dist_to_dog - optimal_herding_dist)
+        herding_reward = max(0.0, 1.0 - (herding_dist_diff / optimal_herding_dist))
+        reward += herding_reward * 0.12
+        
+        # Bonus for being close enough to influence sheep
+        if avg_sheep_dist_to_dog < 250.0:
+            reward += 0.05
+        
+        # 3. PROTECTIVE REWARD: Position between wolf and sheep (stronger)
         if wolf_pos is not None and not info.get("wolf_is_dead", False):
-            wolf_to_dog = np.linalg.norm(dog_pos - wolf_pos)
-            # Average distance from wolf to sheep
-            wolf_to_sheep = np.mean(np.linalg.norm(sheep_positions - wolf_pos, axis=1))
-            # Reward if dog is between wolf and sheep
-            if wolf_to_dog < wolf_to_sheep:
-                reward += 0.1
+            wolf_pos = np.array(wolf_pos)
+            wolf_to_dog_dist = float(np.linalg.norm(dog_pos - wolf_pos))
+            avg_wolf_to_sheep_dist = float(np.mean(np.linalg.norm(sheep_positions - wolf_pos, axis=1)))
+            
+            # Strong reward if dog is between wolf and sheep
+            if wolf_to_dog_dist < avg_wolf_to_sheep_dist:
+                # Reward is stronger when dog is closer to the interception point
+                interception_bonus = (1.0 - (wolf_to_dog_dist / max(avg_wolf_to_sheep_dist, 1.0))) * 0.2
+                reward += interception_bonus
+                
+                # Extra bonus when very close to wolf (about to kill)
+                if wolf_to_dog_dist < 60.0:
+                    reward += 0.15
+            else:
+                # Small penalty if dog is on wrong side (encourages repositioning)
+                if wolf_to_dog_dist > avg_wolf_to_sheep_dist * 1.5:
+                    reward -= 0.05
+        
+        # 4. DIRECTIONAL REWARD: Pushing sheep toward pen entrance
+        # Calculate if sheep are moving in the right direction (toward pen)
+        if pen_entrance is not None:
+            pen_x = pen_entrance[0]
+            # Reward when sheep are moving toward pen (x-axis direction)
+            sheep_x_positions = sheep_positions[:, 0]
+            avg_sheep_x = float(np.mean(sheep_x_positions))
+            
+            # Reward based on how close sheep are to pen (x-coordinate)
+            # Pen is on the right side, so higher x is better
+            x_progress = (avg_sheep_x - (screen_width * 0.3)) / (screen_width * 0.7)  # Normalize
+            x_progress = np.clip(x_progress, 0.0, 1.0)
+            reward += x_progress * 0.08
+        
+        # 5. PROXIMITY TO PEN: Reward when sheep are closer to pen
+        # Normalize distance (pen is roughly at x=screen_width-20)
+        max_pen_dist = np.sqrt(screen_width**2 + config.SCREEN_HEIGHT**2)
+        pen_proximity = 1.0 - min(avg_sheep_dist_to_pen / max_pen_dist, 1.0)
+        reward += pen_proximity * 0.06
+        
+        # Bonus when sheep are very close to pen (about to enter)
+        if avg_sheep_dist_to_pen < 100.0:
+            reward += 0.1
     
-    # Small penalty for time (encourages faster completion)
+    # Small time penalty (encourages faster completion)
     reward -= 0.01
 
     return reward
 
 def wolf_reward_fn(info, prev_info=None) -> float:
+    """
+    Reward function for the wolf agent.
+    Mission: Distract sheep from getting into pen and eat sheep.
+    
+    Sparse rewards:
+    - +200 per sheep eaten (primary objective)
+    - -120 for being killed (major failure)
+    - -80 per sheep entering pen (dog succeeding - competing objective)
+    
+    Dense shaping rewards:
+    - Chasing reward: progress toward nearest sheep (stronger when close)
+    - Proximity reward: being close to sheep
+    - Distraction reward: keeping sheep away from pen (NEW!)
+    - Survival reward: avoiding dog when close
+    - Bonus for very close to sheep (about to eat)
+    """
     reward = 0.0
 
-    # Main objectives (sparse rewards)
+    # ========================================================================
+    # SPARSE REWARDS (Main objectives)
+    # ========================================================================
     sheep_eaten = info.get("sheep_eaten", 0)
     wolf_killed = info.get("wolf_killed", False)
     wolf_is_dead = info.get("wolf_is_dead", False)
     sheep_entered_pen = info.get("sheep_entered_pen", 0)
     
-    # Big rewards/penalties for main events
-    reward += float(sheep_eaten) * 150.0      # Major reward for eating sheep
-    reward -= float(wolf_killed) * 100.0      # Major penalty for dying
-    reward -= float(sheep_entered_pen) * 50.0 # Penalty when dog succeeds
+    reward += float(sheep_eaten) * 200.0      # Major reward for eating sheep
+    reward -= float(wolf_killed) * 120.0      # Major penalty for dying
+    reward -= float(sheep_entered_pen) * 80.0 # Penalty when dog succeeds (competing objective)
     
-    # Dense shaping rewards (only when wolf is alive)
+    # ========================================================================
+    # DENSE SHAPING REWARDS (only when wolf is alive)
+    # ========================================================================
     if not wolf_is_dead:
         sheep_positions = info.get("sheep_positions", None)
         wolf_pos = info.get("wolf_position", None)
         dog_pos = info.get("dog_position", None)
+        pen_center = info.get("pen_center", None)
+        pen_entrance = info.get("pen_entrance_position", None)
         
         if sheep_positions is not None and len(sheep_positions) > 0 and wolf_pos is not None:
-            # Strong shaping: reward for getting close to nearest sheep
+            sheep_positions = np.array(sheep_positions)
+            wolf_pos = np.array(wolf_pos)
+            screen_width = config.SCREEN_WIDTH  # Define once at the start
+            
+            # Calculate distances to sheep
             sheep_dists = np.linalg.norm(sheep_positions - wolf_pos, axis=1)
-            min_dist = float(np.min(sheep_dists))
-            # Normalized distance reward (closer = better)
-            reward += (1.0 - min(min_dist / 500.0, 1.0)) * 0.4
+            min_dist_to_sheep = float(np.min(sheep_dists))
+            avg_dist_to_sheep = float(np.mean(sheep_dists))
+            nearest_sheep_idx = int(np.argmin(sheep_dists))
+            nearest_sheep_pos = sheep_positions[nearest_sheep_idx]
             
-            # Bonus for being very close to sheep (about to eat)
-            if min_dist < 50.0:
-                reward += 0.3
-            
-            # Reward for moving toward sheep (progress-based)
+            # 1. CHASING REWARD: Progress toward nearest sheep (stronger when close)
             if prev_info is not None:
                 prev_wolf_pos = prev_info.get("wolf_position", None)
                 prev_sheep_pos = prev_info.get("sheep_positions", None)
                 if prev_wolf_pos is not None and prev_sheep_pos is not None and len(prev_sheep_pos) == len(sheep_positions):
-                    prev_min_dist = float(np.min(np.linalg.norm(prev_sheep_pos - prev_wolf_pos, axis=1)))
-                    progress = prev_min_dist - min_dist
-                    reward += progress * 0.05  # Reward progress toward sheep
+                    prev_wolf_pos = np.array(prev_wolf_pos)
+                    prev_sheep_pos = np.array(prev_sheep_pos)
+                    prev_dists = np.linalg.norm(prev_sheep_pos - prev_wolf_pos, axis=1)
+                    prev_min_dist = float(np.min(prev_dists))
+                    progress = prev_min_dist - min_dist_to_sheep
+                    
+                    # Scale progress reward: more reward when closer to sheep
+                    # (encourages finishing the chase)
+                    progress_scale = 1.0 + (1.0 - min(min_dist_to_sheep / 300.0, 1.0))
+                    reward += progress * 0.12 * progress_scale
             
-            # Strategic: avoid dog when it's close (survival behavior)
+            # 2. PROXIMITY REWARD: Being close to sheep (stronger)
+            # Normalized distance reward (closer = better, max distance ~600 pixels)
+            proximity_reward = (1.0 - min(min_dist_to_sheep / 500.0, 1.0)) * 0.5
+            reward += proximity_reward
+            
+            # Bonus for being very close to sheep (about to eat)
+            if min_dist_to_sheep < 50.0:
+                reward += 0.4
+            elif min_dist_to_sheep < 80.0:
+                reward += 0.2
+            
+            # 3. DISTRACTION REWARD: Keeping sheep away from pen (NEW!)
+            if pen_center is not None:
+                pen_center = np.array(pen_center)
+                sheep_dists_to_pen = np.linalg.norm(sheep_positions - pen_center, axis=1)
+                avg_sheep_dist_to_pen = float(np.mean(sheep_dists_to_pen))
+                
+                # Reward when sheep are far from pen (wolf is succeeding at distraction)
+                # Normalize: pen is roughly at x=screen_width-20, center is at x=screen_width/2
+                max_pen_dist = np.sqrt(screen_width**2 + config.SCREEN_HEIGHT**2)
+                distraction_score = min(avg_sheep_dist_to_pen / max_pen_dist, 1.0)
+                reward += distraction_score * 0.15
+                
+                # Extra bonus when wolf is actively distracting (near sheep that are moving away from pen)
+                if prev_info is not None:
+                    prev_sheep_pos = prev_info.get("sheep_positions", None)
+                    if prev_sheep_pos is not None and len(prev_sheep_pos) == len(sheep_positions):
+                        prev_sheep_pos = np.array(prev_sheep_pos)
+                        prev_dists_to_pen = np.linalg.norm(prev_sheep_pos - pen_center, axis=1)
+                        # If sheep are moving away from pen (increasing distance), reward wolf
+                        pen_regression = np.mean(sheep_dists_to_pen - prev_dists_to_pen)
+                        if pen_regression > 0:  # Sheep moving away from pen
+                            reward += pen_regression * 0.08
+            
+            # 4. DIRECTIONAL DISTRACTION: Push sheep away from pen entrance
+            if pen_entrance is not None:
+                pen_x = pen_entrance[0]
+                sheep_x_positions = sheep_positions[:, 0]
+                avg_sheep_x = float(np.mean(sheep_x_positions))
+                
+                # Reward when sheep are far from pen (left side of screen)
+                # Penalize when sheep are close to pen (right side)
+                x_distance_from_pen = (pen_x - avg_sheep_x) / screen_width
+                x_distance_from_pen = np.clip(x_distance_from_pen, 0.0, 1.0)
+                reward += x_distance_from_pen * 0.1
+                
+                # Bonus when wolf is between sheep and pen (blocking)
+                if wolf_pos[0] > avg_sheep_x and wolf_pos[0] < pen_x:
+                    reward += 0.15
+            
+            # 5. SURVIVAL REWARD: Avoid dog when it's close (strategic)
             if dog_pos is not None:
-                dog_dist = np.linalg.norm(wolf_pos - dog_pos)
-                if dog_dist < 100.0:  # Dog is dangerous when close
-                    # Penalty for being too close to dog
-                    reward -= (1.0 - dog_dist / 100.0) * 0.25
+                dog_pos = np.array(dog_pos)
+                dog_dist = float(np.linalg.norm(wolf_pos - dog_pos))
+                
+                # Strong penalty when too close to dog (danger zone)
+                if dog_dist < 100.0:
+                    # Exponential penalty: very dangerous when very close
+                    danger_penalty = (1.0 - (dog_dist / 100.0)) ** 2 * 0.4
+                    reward -= danger_penalty
+                    
+                    # If dog is between wolf and sheep, extra penalty (wolf is trapped)
+                    if dog_dist < 60.0:
+                        wolf_to_sheep_dir = nearest_sheep_pos - wolf_pos
+                        dog_to_wolf_dir = wolf_pos - dog_pos
+                        # Check if directions are opposite (wolf is blocked)
+                        dot_product = np.dot(wolf_to_sheep_dir, dog_to_wolf_dir)
+                        if dot_product > 0:  # Dog is blocking path to sheep
+                            reward -= 0.2
                 elif dog_dist < 150.0:  # Moderate danger zone
-                    reward -= (1.0 - dog_dist / 150.0) * 0.1
+                    danger_penalty = (1.0 - (dog_dist / 150.0)) * 0.15
+                    reward -= danger_penalty
+                elif dog_dist > 200.0:
+                    # Small reward for staying safe from dog
+                    reward += 0.05
+            
+            # 6. STRATEGIC POSITIONING: Reward for being near sheep cluster center
+            # (makes wolf more effective at scattering sheep)
+            if len(sheep_positions) > 1:
+                sheep_center = np.mean(sheep_positions, axis=0)
+                dist_to_sheep_center = float(np.linalg.norm(wolf_pos - sheep_center))
+                # Optimal distance: close enough to scatter, but not too close
+                optimal_scatter_dist = 120.0
+                scatter_reward = max(0.0, 1.0 - (dist_to_sheep_center / optimal_scatter_dist))
+                reward += scatter_reward * 0.08
     
-    # Small time penalty to encourage action
+    # Small time penalty (encourages action)
     reward -= 0.01
 
     return reward
