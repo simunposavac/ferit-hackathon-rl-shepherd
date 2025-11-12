@@ -16,12 +16,6 @@ from collections import deque
 import time
 import pygame
 
-# OPTIMIZATION: Set environment variables before importing torch to avoid autotune warnings
-# RTX 3060 (28 SMs) doesn't have enough SMs for max_autotune_gemm mode
-# Disable autotune to avoid warnings and use default compilation mode
-os.environ.setdefault('TORCHINDUCTOR_MAX_AUTOTUNE', '0')  # Disable max autotune (requires many SMs)
-os.environ.setdefault('TORCHINDUCTOR_MAX_AUTOTUNE_GEMM', '0')  # Disable GEMM autotune (requires many SMs)
-
 import numpy as np
 import torch
 import torch.nn as nn
@@ -55,7 +49,7 @@ WOLF_CHECKPOINT_PATH = r"saves/sac/best_wolf.pth"
 # ============================================================================
 
 EPISODES = 1000 # how many episodes to run (Longer - more training, you can checkpoint and resume)
-MAX_STEPS_PER_EPISODE = 2000 # max steps per episode (increased for longer episodes)
+MAX_STEPS_PER_EPISODE = 1500 # max steps per episode (reduced for speed)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 TRAIN_DOG = True
@@ -71,16 +65,16 @@ ALPHA_LR = 3e-4      # Temperature learning rate
 
 GAMMA = 0.99         # Discount factor (importance of future rewards)
 TAU = 0.005          # Target network soft-update rate. How fast the target critics track the main critics (0.005 - stable, 0.01 - tracks faster)
-BATCH_SIZE = 1024    # [512 - 2048] OPTIMIZED FOR RTX 3060: Reduced from 2048 to avoid OOM, still large enough for good GPU utilization
-REPLAY_CAPACITY = 500_000 # [500k - 1M] Max transitions stored in replay buffer (reduced to save memory)
+BATCH_SIZE = 512     # [256 - 1024] OPTIMIZED FOR RTX 3060: Larger batches = better GPU utilization (12GB VRAM can handle this)
+REPLAY_CAPACITY = 500_000 # [250k - 1M] Max transitions stored in replay buffer, Larger = more diverse data (optimized for GPU)
 WARMUP_STEPS = 5_000 # Number of env steps collected before any learning (enough to fill replay buffer)
 STEPS_PER_UPDATE = 1 # Do updates every N environment steps (OPTIMIZED: update every step for maximum GPU usage)
-UPDATES_PER_STEP = 8 # Number of gradient updates per trigger (REDUCED: 8 updates to avoid OOM, still keeps GPU busy)
+UPDATES_PER_STEP = 4 # Number of gradient updates per trigger (OPTIMIZED: multiple updates to fully utilize GPU)
 TARGET_ENTROPY = None  # None => will set -action_dim below (-2 for 2D action) (more negative - stronger exploration)
 AUTOMATIC_ENTROPY_TUNING = True # If True, learn temperature α to match TARGET_ENTROPY. (Leave True)
 
 # Rendering
-HEADLESS = True  # MAXIMIZED: Headless mode for maximum speed (no window = faster training)
+HEADLESS = False # Window opens but we won't render (still fast!)
 RENDER_EVERY = 0  # 0 disables auto-render - THIS IS KEY FOR SPEED!
 
 # ============================================================================
@@ -88,9 +82,9 @@ RENDER_EVERY = 0  # 0 disables auto-render - THIS IS KEY FOR SPEED!
 # ============================================================================
 
 # Encodes the observation grid (channels × H × W) and concatenates the 2-D pen vector; outputs a feature vector.
-# hidden_dim: Size of the MLP output. Higher = more capacity, slower. OPTIMIZED: 768 for RTX 3060 to balance memory and performance
+# hidden_dim: Size of the MLP output. Higher = more capacity, slower. OPTIMIZED: 768 for RTX 3060 GPU utilization
 class CNNFeature(nn.Module):
-    """CNN feature extractor for grid observations - OPTIMIZED for RTX 3060 GPU utilization."""
+    """CNN feature extractor for grid observations - OPTIMIZED for GPU utilization."""
     def __init__(self, observation_shape, pen_vec_dim=2, hidden_dim=768):
         super().__init__()
         channels, height, width = observation_shape
@@ -201,18 +195,28 @@ class ReplayBuffer:
     def __init__(self, capacity: int, observation_shape, pen_vec_dim=2, action_dim=2, device='cpu'):
         self.capacity = capacity
         self.device = device
-        # OPTIMIZATION: Replay buffer is always stored on CPU (RAM), not GPU
-        # This prevents OOM errors - only batches are transferred to GPU during training
-        
-        # Create numpy arrays directly on CPU (much more memory efficient)
-        # Using numpy arrays avoids GPU memory allocation entirely
-        self.obs_buf = np.zeros((capacity, *observation_shape), dtype=np.float32)
-        self.pen_buf = np.zeros((capacity, pen_vec_dim), dtype=np.float32)
-        self.act_buf = np.zeros((capacity, action_dim), dtype=np.float32)
-        self.rew_buf = np.zeros((capacity, 1), dtype=np.float32)
-        self.next_obs_buf = np.zeros((capacity, *observation_shape), dtype=np.float32)
-        self.next_pen_buf = np.zeros((capacity, pen_vec_dim), dtype=np.float32)
-        self.done_buf = np.zeros((capacity, 1), dtype=np.float32)
+        # OPTIMIZATION: Use pinned memory for faster CPU->GPU transfers on CUDA
+        self.use_pinned_memory = (device == 'cuda')
+
+        # Use pinned memory buffers if on GPU (faster CPU->GPU transfers)
+        if self.use_pinned_memory:
+            # Create pinned memory buffers using torch
+            self.obs_buf = torch.zeros((capacity, *observation_shape), dtype=torch.float32, pin_memory=True).cpu().numpy()
+            self.pen_buf = torch.zeros((capacity, pen_vec_dim), dtype=torch.float32, pin_memory=True).cpu().numpy()
+            self.act_buf = torch.zeros((capacity, action_dim), dtype=torch.float32, pin_memory=True).cpu().numpy()
+            self.rew_buf = torch.zeros((capacity, 1), dtype=torch.float32, pin_memory=True).cpu().numpy()
+            self.next_obs_buf = torch.zeros((capacity, *observation_shape), dtype=torch.float32, pin_memory=True).cpu().numpy()
+            self.next_pen_buf = torch.zeros((capacity, pen_vec_dim), dtype=torch.float32, pin_memory=True).cpu().numpy()
+            self.done_buf = torch.zeros((capacity, 1), dtype=torch.float32, pin_memory=True).cpu().numpy()
+        else:
+            # Standard numpy arrays for CPU
+            self.obs_buf = np.zeros((capacity, *observation_shape), dtype=np.float32)
+            self.pen_buf = np.zeros((capacity, pen_vec_dim), dtype=np.float32)
+            self.act_buf = np.zeros((capacity, action_dim), dtype=np.float32)
+            self.rew_buf = np.zeros((capacity, 1), dtype=np.float32)
+            self.next_obs_buf = np.zeros((capacity, *observation_shape), dtype=np.float32)
+            self.next_pen_buf = np.zeros((capacity, pen_vec_dim), dtype=np.float32)
+            self.done_buf = np.zeros((capacity, 1), dtype=np.float32)
 
         self.ptr = 0
         self.size = 0
@@ -230,20 +234,14 @@ class ReplayBuffer:
         self.size = min(self.size + 1, self.capacity)
 
     def sample(self, batch_size: int):
-        """Sample batch and transfer to GPU (buffer is on CPU, only batch goes to GPU)."""
         idxs = np.random.randint(0, self.size, size=batch_size)
-        
-        # OPTIMIZATION: Transfer only the sampled batch to GPU (not entire buffer)
-        # This is memory efficient - buffer stays on CPU, only small batches go to GPU
-        # Use from_numpy() for efficient conversion (shares memory if possible)
-        obs = torch.from_numpy(self.obs_buf[idxs]).to(self.device, non_blocking=True)
-        pen = torch.from_numpy(self.pen_buf[idxs]).to(self.device, non_blocking=True)
-        act = torch.from_numpy(self.act_buf[idxs]).to(self.device, non_blocking=True)
-        rew = torch.from_numpy(self.rew_buf[idxs]).to(self.device, non_blocking=True)
-        next_obs = torch.from_numpy(self.next_obs_buf[idxs]).to(self.device, non_blocking=True)
-        next_pen = torch.from_numpy(self.next_pen_buf[idxs]).to(self.device, non_blocking=True)
-        done = torch.from_numpy(self.done_buf[idxs]).to(self.device, non_blocking=True)
-        
+        obs = torch.as_tensor(self.obs_buf[idxs], device=self.device)
+        pen = torch.as_tensor(self.pen_buf[idxs], device=self.device)
+        act = torch.as_tensor(self.act_buf[idxs], device=self.device)
+        rew = torch.as_tensor(self.rew_buf[idxs], device=self.device)
+        next_obs = torch.as_tensor(self.next_obs_buf[idxs], device=self.device)
+        next_pen = torch.as_tensor(self.next_pen_buf[idxs], device=self.device)
+        done = torch.as_tensor(self.done_buf[idxs], device=self.device)
         return obs, pen, act, rew, next_obs, next_pen, done
 
 # ===============================
@@ -290,23 +288,13 @@ class SACAgent(BaseAgent):
 
         self.use_amp = (device == 'cuda')
         if self.use_amp:
-            # OPTIMIZATION: Enable all GPU optimizations for RTX 3060
-            torch.backends.cudnn.benchmark = True  # Fixed input sizes, faster convs (significant speedup)
+            torch.backends.cudnn.benchmark = True  # fixed input sizes, faster convs
             torch.backends.cudnn.deterministic = False  # Allow non-deterministic for speed
             # Enable TensorFloat-32 (TF32) for faster matmuls on Ampere GPUs (RTX 3060)
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
-            # OPTIMIZATION: Enable cuDNN heuristics for better performance
-            torch.backends.cudnn.enabled = True
-            # OPTIMIZATION: Use faster attention implementations if available (PyTorch 2.0+)
-            try:
-                if hasattr(torch.backends.cuda, 'sdp_kernel'):
-                    torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=True)
-            except Exception:
-                pass  # Not available in older PyTorch versions
-            # OPTIMIZATION: Optimize gradient scaler for large batches
-            self.critic_scaler = torch.amp.GradScaler('cuda', init_scale=65536.0, growth_factor=2.0, backoff_factor=0.5)
-            self.actor_scaler = torch.amp.GradScaler('cuda', init_scale=65536.0, growth_factor=2.0, backoff_factor=0.5)
+            self.critic_scaler = torch.amp.GradScaler('cuda')
+            self.actor_scaler = torch.amp.GradScaler('cuda')
         else:
             self.critic_scaler = None
             self.actor_scaler = None
@@ -320,22 +308,15 @@ class SACAgent(BaseAgent):
         
         # OPTIMIZATION: Use torch.compile for PyTorch 2.0+ (significant speedup)
         # This requires PyTorch 2.0+ and can provide 20-30% speedup
-        # Note: RTX 3060 (28 SMs) doesn't have enough SMs for max_autotune_gemm mode
-        # Environment variables set above disable autotune to avoid warnings
         if device == 'cuda' and hasattr(torch, 'compile'):
             try:
-                # Use 'default' mode - compatible with RTX 3060 (autotune disabled via env vars)
-                # This avoids the "not enough SMs" warning while still providing speedup
-                compile_mode = 'default'  # RTX 3060 compatible (autotune disabled)
-                print(f"  [OPTIMIZATION] Using torch.compile for {agent_type} agent (mode: {compile_mode}, autotune disabled)")
-                # fullgraph=False allows partial compilation (faster, more compatible)
-                self.actor = torch.compile(self.actor, mode=compile_mode, fullgraph=False)
-                self.critic = torch.compile(self.critic, mode=compile_mode, fullgraph=False)
+                print(f"  [OPTIMIZATION] Using torch.compile for {agent_type} agent (PyTorch 2.0+)")
+                self.actor = torch.compile(self.actor, mode='reduce-overhead')
+                self.critic = torch.compile(self.critic, mode='reduce-overhead')
                 # Note: critic_target doesn't need compilation as it's rarely used
             except Exception as e:
                 print(f"  [WARNING] torch.compile not available or failed: {e}")
-                print(f"  [INFO] Continuing without torch.compile (models will still work)")
-                # If compile fails, models are already on device, so we continue
+                print(f"  [INFO] Continuing without torch.compile")
 
         self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=lr)
         self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=lr)
@@ -359,26 +340,17 @@ class SACAgent(BaseAgent):
         return self.log_alpha.exp()
 
     def _to_tensor_inputs(self, observation: np.ndarray, pen_vector: np.ndarray):
-        """Optimized tensor conversion with non-blocking transfers for CUDA."""
-        # OPTIMIZATION: Use from_numpy for efficient conversion, non_blocking for async transfer
-        # torch.as_tensor() doesn't support pin_memory, so we use from_numpy() + to() with non_blocking
-        obs_grid = torch.from_numpy(observation).float().unsqueeze(0).to(self.device, non_blocking=True)
-        pen_vec = torch.from_numpy(pen_vector).float().unsqueeze(0).to(self.device, non_blocking=True)
+        obs_grid = torch.as_tensor(observation, dtype=torch.float32, device=self.device).unsqueeze(0)
+        pen_vec = torch.as_tensor(pen_vector, dtype=torch.float32, device=self.device).unsqueeze(0)
         return obs_grid, pen_vec
 
     def act(self, observation: np.ndarray, pen_vector: np.ndarray):
-        """Optimized action inference - actor stays in eval mode for faster inference."""
-        # OPTIMIZATION: Keep actor in eval mode (no need to switch modes for inference)
-        # Actor will be set to train() mode only during _update() for gradient computation
-        if self.actor.training:
-            self.actor.eval()
-        
+        self.actor.eval()
         with torch.no_grad():
-            # OPTIMIZATION: Use float16 for faster inference on modern GPUs
-            with torch.amp.autocast('cuda', enabled=self.use_amp, dtype=torch.float16):
-                obs_grid, pen_vec = self._to_tensor_inputs(observation, pen_vector)
-                action_t, _, _ = self.actor.sample(obs_grid, pen_vec)
-                action = action_t[0].cpu().numpy()
+            obs_grid, pen_vec = self._to_tensor_inputs(observation, pen_vector)
+            action_t, _, _ = self.actor.sample(obs_grid, pen_vec)
+            action = action_t[0].cpu().numpy()
+        self.actor.train()
 
         # Map to env action semantics
         forward_speed = (float(action[0]) + 1.0) / 2.0
@@ -413,50 +385,29 @@ class SACAgent(BaseAgent):
 
         # Begin SGD only after warmup, and not every step (decouples FPS from SGD)
         if self.replay.size >= self.learning_starts and (self.total_steps % self.update_every == 0):
-            # OPTIMIZATION: Clear cache before updates to free memory
-            if self.device == 'cuda':
-                torch.cuda.empty_cache()
             for _ in range(self.max_updates_per_step):
                 self._update()
-                # OPTIMIZATION: Clear cache periodically during updates to avoid OOM
-                # Uncomment if you still get OOM errors:
-                # if self.device == 'cuda' and _ % 4 == 0:
-                #     torch.cuda.empty_cache()
 
     def _update(self):
-        """Optimized update with fused operations and better GPU utilization."""
-        # OPTIMIZATION: Ensure actor is in training mode for gradient computation
-        if not self.actor.training:
-            self.actor.train()
-        
-        # OPTIMIZATION: Sample batch and ensure it's on GPU
         obs, pen, act, rew, next_obs, next_pen, done = self.replay.sample(self.batch_size)
-        
-        # OPTIMIZATION: Clear intermediate cache before compute
-        if self.device == 'cuda':
-            torch.cuda.empty_cache()
 
         # ----- Critic update (with AMP when CUDA) -----
-        # OPTIMIZATION: Use float16 for faster computation on modern GPUs
-        with torch.amp.autocast('cuda', enabled=self.use_amp, dtype=torch.float16), torch.no_grad():
+        with torch.amp.autocast('cuda', enabled=self.use_amp), torch.no_grad():
             next_action, next_logp, _ = self.actor.sample(next_obs, next_pen)
             q1_targ, q2_targ = self.critic_target(next_obs, next_pen, next_action)
             q_targ_min = torch.min(q1_targ, q2_targ)
             target_v = q_targ_min - self.alpha * next_logp
             backup = rew + (1.0 - done) * self.gamma * target_v
 
-        # OPTIMIZATION: Use set_to_none=True for faster zero_grad (PyTorch 1.7+)
         self.critic_opt.zero_grad(set_to_none=True)
-        with torch.amp.autocast('cuda', enabled=self.use_amp, dtype=torch.float16):
+        with torch.amp.autocast('cuda', enabled=self.use_amp):
             q1, q2 = self.critic(obs, pen, act)
-            # OPTIMIZATION: Fused loss computation with explicit reduction
-            critic_loss = nn.functional.mse_loss(q1, backup, reduction='mean') + nn.functional.mse_loss(q2, backup, reduction='mean')
+            critic_loss = nn.functional.mse_loss(q1, backup) + nn.functional.mse_loss(q2, backup)
 
         if self.critic_scaler is not None:
             self.critic_scaler.scale(critic_loss).backward()
-            # OPTIMIZATION: Unscale before gradient clipping for numerical stability
             self.critic_scaler.unscale_(self.critic_opt)
-            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)  # Standard clip for stability
+            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
             self.critic_scaler.step(self.critic_opt)
             self.critic_scaler.update()
         else:
@@ -466,7 +417,7 @@ class SACAgent(BaseAgent):
 
         # ----- Actor update (with AMP) -----
         self.actor_opt.zero_grad(set_to_none=True)
-        with torch.amp.autocast('cuda', enabled=self.use_amp, dtype=torch.float16):
+        with torch.amp.autocast('cuda', enabled=self.use_amp):
             action_pi, logp_pi, _ = self.actor.sample(obs, pen)
             q1_pi, q2_pi = self.critic(obs, pen, action_pi)
             q_pi = torch.min(q1_pi, q2_pi)
@@ -475,7 +426,7 @@ class SACAgent(BaseAgent):
         if self.actor_scaler is not None:
             self.actor_scaler.scale(actor_loss).backward()
             self.actor_scaler.unscale_(self.actor_opt)
-            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)  # Standard clip for stability
+            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
             self.actor_scaler.step(self.actor_opt)
             self.actor_scaler.update()
         else:
@@ -490,9 +441,8 @@ class SACAgent(BaseAgent):
             alpha_loss.backward()
             self.alpha_opt.step()
 
-        # ----- Target network soft update (optimized with in-place operations) -----
+        # ----- Target network soft update -----
         with torch.no_grad():
-            # OPTIMIZATION: In-place operations are already used, keeping as-is for efficiency
             for p, p_targ in zip(self.critic.parameters(), self.critic_target.parameters()):
                 p_targ.data.mul_(1 - self.tau)
                 p_targ.data.add_(self.tau * p.data)
@@ -977,12 +927,12 @@ def train(
         gamma=GAMMA,
         tau=TAU,
         lr=ACTOR_LR,
-        hidden_dim=768,  # OPTIMIZED: Balanced network size to avoid OOM while maintaining good performance
+        hidden_dim=768,  # OPTIMIZED: Larger network for better GPU utilization (RTX 3060 can handle 768)
         buffer_capacity=REPLAY_CAPACITY,
         batch_size=BATCH_SIZE,
         updates_per_step=1,          # kept for compatibility
         update_every=STEPS_PER_UPDATE,  # train every N steps
-        max_updates_per_step=UPDATES_PER_STEP,  # OPTIMIZED: 8 updates to avoid OOM while keeping GPU busy
+        max_updates_per_step=UPDATES_PER_STEP,  # OPTIMIZED: Multiple updates per step to fully utilize GPU
         learning_starts=WARMUP_STEPS,  # start learning after warmup
         automatic_entropy_tuning=AUTOMATIC_ENTROPY_TUNING,
         pen_vec_dim=2

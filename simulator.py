@@ -126,78 +126,24 @@ class Simulator:
             self.clock = pygame.time.Clock()
         else:
             # Initialize pygame without display for headless mode
-            # CRITICAL: Entity sprites need a display mode to load images
-            # So we must create a minimal display even in headless mode
-            
-            # Set dummy video driver BEFORE pygame.init() (works on Linux/Mac)
-            # On Windows, this might not work, so we'll try both approaches
-            original_sdl_driver = os.environ.get('SDL_VIDEODRIVER', None)
-            try:
-                # First try: Use dummy driver (Linux/Mac)
-                if 'SDL_VIDEODRIVER' not in os.environ:
-                    os.environ['SDL_VIDEODRIVER'] = 'dummy'
-                
-                pygame.init()
-                pygame.display.init()
-                # Create a minimal display surface (required for image loading)
-                # Size doesn't matter - just needs to exist
-                try:
-                    # Try with NOFRAME flag (creates window without frame, less visible)
-                    pygame.display.set_mode((1, 1), flags=pygame.NOFRAME)
-                except:
-                    # If NOFRAME doesn't work, try without flags
-                    pygame.display.set_mode((1, 1))
-                    
-            except Exception as e:
-                # Fallback: Try without dummy driver (Windows might need this)
-                try:
-                    # Restore original driver setting
-                    if original_sdl_driver is not None:
-                        os.environ['SDL_VIDEODRIVER'] = original_sdl_driver
-                    elif 'SDL_VIDEODRIVER' in os.environ:
-                        os.environ.pop('SDL_VIDEODRIVER')
-                    
-                    # Re-initialize pygame without dummy driver
-                    pygame.quit()
-                    pygame.init()
-                    pygame.display.init()
-                    # Create a minimal display (will create a small window, but that's OK for headless)
-                    pygame.display.set_mode((1, 1))
-                    print(f"Note: Using standard display driver for headless mode (dummy driver not available)")
-                except Exception as e2:
-                    # Last resort: Try to initialize normally and create a small window
-                    # This will create a visible window, but at least it will work
-                    print(f"Warning: Could not use dummy display driver: {e}")
-                    print(f"Falling back to standard display (small window may appear)")
-                    if 'SDL_VIDEODRIVER' in os.environ:
-                        os.environ.pop('SDL_VIDEODRIVER')
-                    pygame.quit()
-                    pygame.init()
-                    pygame.display.set_mode((1, 1))
-            
-            self.screen = None  # We don't use screen for rendering in headless mode
+            os.environ['SDL_VIDEODRIVER'] = 'dummy'
+            pygame.init()
+            self.screen = None
             self.clock = None
         
         # Create background
-        if not headless:
-            # Only load images if not headless (images are not needed for headless mode)
-            background_pil = create_green_background_image(
-                self.height, 
-                self.width, 
-                texture_strength=config.BACKGROUND_TEXTURE_STRENGTH
-            )
-            background_mode = background_pil.mode
-            background_size = background_pil.size
-            background_data = background_pil.tobytes()
-            #self.background_surface = pygame.image.fromstring(background_data, background_size, background_mode)
-            W, H = background_size
-            tile = pygame.image.load("images/grass2.jpg").convert()  
-            self.background_surface = make_tiled_surface(tile, (W, H), density=4.0)
-        else:
-            # In headless mode, create a minimal dummy surface (not used for rendering)
-            # This avoids errors when environment tries to use the background
-            self.background_surface = pygame.Surface((self.width, self.height))
-            self.background_surface.fill((34, 139, 34))  # Green color (not used, but required for compatibility)
+        background_pil = create_green_background_image(
+            self.height, 
+            self.width, 
+            texture_strength=config.BACKGROUND_TEXTURE_STRENGTH
+        )
+        background_mode = background_pil.mode
+        background_size = background_pil.size
+        background_data = background_pil.tobytes()
+        #self.background_surface = pygame.image.fromstring(background_data, background_size, background_mode)
+        W, H = background_size
+        tile = pygame.image.load("images/grass2.jpg").convert()  
+        self.background_surface = make_tiled_surface(tile, (W, H), density=4.0)
         
         # Initialize environment
         self.env = Environment(self.width, self.height, self.background_surface)
