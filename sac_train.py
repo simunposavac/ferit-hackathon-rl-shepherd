@@ -195,28 +195,18 @@ class ReplayBuffer:
     def __init__(self, capacity: int, observation_shape, pen_vec_dim=2, action_dim=2, device='cpu'):
         self.capacity = capacity
         self.device = device
-        # OPTIMIZATION: Use pinned memory for faster CPU->GPU transfers on CUDA
-        self.use_pinned_memory = (device == 'cuda')
-
-        # Use pinned memory buffers if on GPU (faster CPU->GPU transfers)
-        if self.use_pinned_memory:
-            # Create pinned memory buffers using torch
-            self.obs_buf = torch.zeros((capacity, *observation_shape), dtype=torch.float32, pin_memory=True).cpu().numpy()
-            self.pen_buf = torch.zeros((capacity, pen_vec_dim), dtype=torch.float32, pin_memory=True).cpu().numpy()
-            self.act_buf = torch.zeros((capacity, action_dim), dtype=torch.float32, pin_memory=True).cpu().numpy()
-            self.rew_buf = torch.zeros((capacity, 1), dtype=torch.float32, pin_memory=True).cpu().numpy()
-            self.next_obs_buf = torch.zeros((capacity, *observation_shape), dtype=torch.float32, pin_memory=True).cpu().numpy()
-            self.next_pen_buf = torch.zeros((capacity, pen_vec_dim), dtype=torch.float32, pin_memory=True).cpu().numpy()
-            self.done_buf = torch.zeros((capacity, 1), dtype=torch.float32, pin_memory=True).cpu().numpy()
-        else:
-            # Standard numpy arrays for CPU
-            self.obs_buf = np.zeros((capacity, *observation_shape), dtype=np.float32)
-            self.pen_buf = np.zeros((capacity, pen_vec_dim), dtype=np.float32)
-            self.act_buf = np.zeros((capacity, action_dim), dtype=np.float32)
-            self.rew_buf = np.zeros((capacity, 1), dtype=np.float32)
-            self.next_obs_buf = np.zeros((capacity, *observation_shape), dtype=np.float32)
-            self.next_pen_buf = np.zeros((capacity, pen_vec_dim), dtype=np.float32)
-            self.done_buf = np.zeros((capacity, 1), dtype=np.float32)
+        # OPTIMIZATION: Replay buffer is always stored on CPU (RAM), not GPU
+        # This prevents OOM errors - only batches are transferred to GPU during training
+        
+        # Create numpy arrays directly on CPU (much more memory efficient)
+        # Using numpy arrays avoids GPU memory allocation entirely
+        self.obs_buf = np.zeros((capacity, *observation_shape), dtype=np.float32)
+        self.pen_buf = np.zeros((capacity, pen_vec_dim), dtype=np.float32)
+        self.act_buf = np.zeros((capacity, action_dim), dtype=np.float32)
+        self.rew_buf = np.zeros((capacity, 1), dtype=np.float32)
+        self.next_obs_buf = np.zeros((capacity, *observation_shape), dtype=np.float32)
+        self.next_pen_buf = np.zeros((capacity, pen_vec_dim), dtype=np.float32)
+        self.done_buf = np.zeros((capacity, 1), dtype=np.float32)
 
         self.ptr = 0
         self.size = 0
@@ -234,19 +224,18 @@ class ReplayBuffer:
         self.size = min(self.size + 1, self.capacity)
 
     def sample(self, batch_size: int):
-        """Sample batch with optimized GPU transfers (non-blocking for CUDA)."""
+        """Sample batch and transfer to GPU (buffer is on CPU, only batch goes to GPU)."""
         idxs = np.random.randint(0, self.size, size=batch_size)
         
-        # OPTIMIZATION: Use non-blocking transfers for CUDA (allows CPU-GPU overlap)
-        pin_memory = (self.device == 'cuda')
-        
-        obs = torch.as_tensor(self.obs_buf[idxs], device=self.device, pin_memory=pin_memory)
-        pen = torch.as_tensor(self.pen_buf[idxs], device=self.device, pin_memory=pin_memory)
-        act = torch.as_tensor(self.act_buf[idxs], device=self.device, pin_memory=pin_memory)
-        rew = torch.as_tensor(self.rew_buf[idxs], device=self.device, pin_memory=pin_memory)
-        next_obs = torch.as_tensor(self.next_obs_buf[idxs], device=self.device, pin_memory=pin_memory)
-        next_pen = torch.as_tensor(self.next_pen_buf[idxs], device=self.device, pin_memory=pin_memory)
-        done = torch.as_tensor(self.done_buf[idxs], device=self.device, pin_memory=pin_memory)
+        # OPTIMIZATION: Transfer only the sampled batch to GPU (not entire buffer)
+        # This is memory efficient - buffer stays on CPU, only small batches go to GPU
+        obs = torch.from_numpy(self.obs_buf[idxs]).to(self.device)
+        pen = torch.from_numpy(self.pen_buf[idxs]).to(self.device)
+        act = torch.from_numpy(self.act_buf[idxs]).to(self.device)
+        rew = torch.from_numpy(self.rew_buf[idxs]).to(self.device)
+        next_obs = torch.from_numpy(self.next_obs_buf[idxs]).to(self.device)
+        next_pen = torch.from_numpy(self.next_pen_buf[idxs]).to(self.device)
+        done = torch.from_numpy(self.done_buf[idxs]).to(self.device)
         
         return obs, pen, act, rew, next_obs, next_pen, done
 
