@@ -16,6 +16,12 @@ from collections import deque
 import time
 import pygame
 
+# OPTIMIZATION: Set environment variables before importing torch to avoid autotune warnings
+# RTX 3060 (28 SMs) doesn't have enough SMs for max_autotune_gemm mode
+# Disable autotune to avoid warnings and use default compilation mode
+os.environ.setdefault('TORCHINDUCTOR_MAX_AUTOTUNE', '0')  # Disable max autotune (requires many SMs)
+os.environ.setdefault('TORCHINDUCTOR_MAX_AUTOTUNE_GEMM', '0')  # Disable GEMM autotune (requires many SMs)
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -314,15 +320,22 @@ class SACAgent(BaseAgent):
         
         # OPTIMIZATION: Use torch.compile for PyTorch 2.0+ (significant speedup)
         # This requires PyTorch 2.0+ and can provide 20-30% speedup
+        # Note: RTX 3060 (28 SMs) doesn't have enough SMs for max_autotune_gemm mode
+        # Environment variables set above disable autotune to avoid warnings
         if device == 'cuda' and hasattr(torch, 'compile'):
             try:
-                print(f"  [OPTIMIZATION] Using torch.compile for {agent_type} agent (PyTorch 2.0+)")
-                self.actor = torch.compile(self.actor, mode='reduce-overhead')
-                self.critic = torch.compile(self.critic, mode='reduce-overhead')
+                # Use 'default' mode - compatible with RTX 3060 (autotune disabled via env vars)
+                # This avoids the "not enough SMs" warning while still providing speedup
+                compile_mode = 'default'  # RTX 3060 compatible (autotune disabled)
+                print(f"  [OPTIMIZATION] Using torch.compile for {agent_type} agent (mode: {compile_mode}, autotune disabled)")
+                # fullgraph=False allows partial compilation (faster, more compatible)
+                self.actor = torch.compile(self.actor, mode=compile_mode, fullgraph=False)
+                self.critic = torch.compile(self.critic, mode=compile_mode, fullgraph=False)
                 # Note: critic_target doesn't need compilation as it's rarely used
             except Exception as e:
                 print(f"  [WARNING] torch.compile not available or failed: {e}")
-                print(f"  [INFO] Continuing without torch.compile")
+                print(f"  [INFO] Continuing without torch.compile (models will still work)")
+                # If compile fails, models are already on device, so we continue
 
         self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=lr)
         self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=lr)
