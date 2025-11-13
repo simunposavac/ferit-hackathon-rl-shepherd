@@ -661,8 +661,20 @@ class SACAgent(BaseAgent):
 # - Start simple - with one main term (distance to pen for dog, distance to nearest sheep for wolf), then add events later.
 # ----------------------------------------------------------------------------
 
+# Track dog interaction history for "last 5 seconds" check (assuming ~1 step per second)
+_dog_interaction_history = []  # List of (step, had_interaction) tuples
+_MAX_HISTORY_STEPS = 5  # 5 seconds worth of steps
+
 def dog_reward_fn(info: Dict[str, any], prev_info: Dict[str, any]=None) -> float:
+    global _dog_interaction_history
+    
     reward = 0.0
+    current_step = info.get("step", 0)
+    current_episode = info.get("episode", 0)
+    
+    # Reset history if this is a new episode (step 0 or episode changed)
+    if current_step == 0 or (prev_info is not None and prev_info.get("episode", 0) != current_episode):
+        _dog_interaction_history = []
 
     # Main objectives (sparse rewards)
     sheep_entered = info.get("sheep_entered_pen", 0)
@@ -873,6 +885,73 @@ def dog_reward_fn(info: Dict[str, any], prev_info: Dict[str, any]=None) -> float
                     if visible_sheep_count == 0:
                         reward -= 0.4  # Significant penalty for abandoning sheep
     
+    # ========================================================================
+    # MAXIMUM PENALTY: Dog didn't guide sheep to pen
+    # Check if: 1) dog looks opposite way of pen, 2) doesn't see any group of sheep,
+    # 3) in last 5 seconds didn't interact with them
+    # ========================================================================
+    if sheep_positions is not None and len(sheep_positions) > 0 and dog_pos is not None and pen_center is not None:
+        if dog_velocity is not None and np.linalg.norm(dog_velocity) > 0.1:
+            dog_velocity_normalized = dog_velocity / np.linalg.norm(dog_velocity)
+            dog_to_pen = pen_center - dog_pos
+            dog_to_pen_norm = np.linalg.norm(dog_to_pen)
+            
+            if dog_to_pen_norm > 1.0:
+                dog_to_pen_normalized = dog_to_pen / dog_to_pen_norm
+                alignment_to_pen = np.dot(dog_velocity_normalized, dog_to_pen_normalized)
+                
+                # Condition 1: Dog looks opposite way of pen (moving away from pen)
+                looks_opposite_pen = alignment_to_pen < -0.5
+                
+                # Condition 2: Doesn't see any group of sheep
+                visible_sheep_groups = 0
+                max_vision_range = 350.0
+                for sheep_pos in sheep_positions:
+                    dog_to_sheep = sheep_pos - dog_pos
+                    dist_to_sheep = np.linalg.norm(dog_to_sheep)
+                    
+                    if dist_to_sheep < max_vision_range and dist_to_sheep > 1.0:
+                        dog_to_sheep_normalized = dog_to_sheep / dist_to_sheep
+                        front_score = np.dot(dog_velocity_normalized, dog_to_sheep_normalized)
+                        # Sheep is visible if not completely behind
+                        if front_score > -0.7:
+                            visible_sheep_groups += 1
+                
+                # Check if there's a group (at least 2 sheep visible)
+                sees_sheep_group = visible_sheep_groups >= 2
+                
+                # Condition 3: Check interaction history (last 5 seconds)
+                # Check if dog had any interaction with sheep in recent history
+                # Interaction = being close to sheep (< 200 pixels) or having sheep in front
+                had_recent_interaction = False
+                if len(_dog_interaction_history) > 0:
+                    # Check last 5 steps
+                    recent_steps = [h for h in _dog_interaction_history if current_step - h[0] <= _MAX_HISTORY_STEPS]
+                    had_recent_interaction = any(h[1] for h in recent_steps)
+                
+                # Check current interaction
+                current_interaction = False
+                for sheep_pos in sheep_positions:
+                    dog_to_sheep = sheep_pos - dog_pos
+                    dist_to_sheep = np.linalg.norm(dog_to_sheep)
+                    if dist_to_sheep < 200.0:  # Close to sheep
+                        if dist_to_sheep > 1.0:
+                            dog_to_sheep_normalized = dog_to_sheep / dist_to_sheep
+                            front_score = np.dot(dog_velocity_normalized, dog_to_sheep_normalized)
+                            if front_score > -0.5:  # Sheep in front or side
+                                current_interaction = True
+                                break
+                
+                # Update interaction history
+                _dog_interaction_history.append((current_step, current_interaction))
+                # Keep only recent history
+                _dog_interaction_history = [h for h in _dog_interaction_history if current_step - h[0] <= _MAX_HISTORY_STEPS]
+                
+                # If all three conditions are met: maximum penalty
+                if looks_opposite_pen and not sees_sheep_group and not (had_recent_interaction or current_interaction):
+                    # Maximum penalty: reduce all positive rewards
+                    reward = min(reward, -5.0)  # Cap at -5.0 or keep existing negative rewards
+    
     # Small penalty for time (encourages faster completion)
     reward -= 0.01
 
@@ -896,7 +975,9 @@ def wolf_reward_fn(info, prev_info=None) -> float:
     if not wolf_is_dead:
         sheep_positions = info.get("sheep_positions", None)
         wolf_pos = info.get("wolf_position", None)
+        wolf_velocity = info.get("wolf_velocity", None)
         dog_pos = info.get("dog_position", None)
+        pen_center = info.get("pen_center", None)
         
         if sheep_positions is not None and len(sheep_positions) > 0 and wolf_pos is not None:
             # Strong shaping: reward for getting close to nearest sheep
@@ -926,6 +1007,62 @@ def wolf_reward_fn(info, prev_info=None) -> float:
                     reward -= (1.0 - dog_dist / 100.0) * 0.25
                 elif dog_dist < 150.0:  # Moderate danger zone
                     reward -= (1.0 - dog_dist / 150.0) * 0.1
+            
+            # ========================================================================
+            # WOLF PENALTY: Negative reward if wolf guides sheep to pen
+            # ========================================================================
+            if wolf_velocity is not None and np.linalg.norm(wolf_velocity) > 0.1 and pen_center is not None:
+                wolf_velocity_normalized = wolf_velocity / np.linalg.norm(wolf_velocity)
+                wolf_to_pen = pen_center - wolf_pos
+                wolf_to_pen_norm = np.linalg.norm(wolf_to_pen)
+                
+                if wolf_to_pen_norm > 1.0:
+                    wolf_to_pen_normalized = wolf_to_pen / wolf_to_pen_norm
+                    alignment_to_pen = np.dot(wolf_velocity_normalized, wolf_to_pen_normalized)
+                    
+                    # If wolf's vector is collinear with pen vector (moving toward pen)
+                    # This means wolf is guiding sheep toward pen (bad for wolf)
+                    if alignment_to_pen > 0.7:  # Strongly aligned with pen direction
+                        reward -= 0.5  # Penalty for helping sheep reach pen
+            
+            # ========================================================================
+            # WOLF POSITIVE REWARD: Wolf's vector to pen is opposite and sheep group on opposite side
+            # ========================================================================
+            if wolf_velocity is not None and np.linalg.norm(wolf_velocity) > 0.1 and pen_center is not None:
+                wolf_velocity_normalized = wolf_velocity / np.linalg.norm(wolf_velocity)
+                wolf_to_pen = pen_center - wolf_pos
+                wolf_to_pen_norm = np.linalg.norm(wolf_to_pen)
+                
+                if wolf_to_pen_norm > 1.0:
+                    wolf_to_pen_normalized = wolf_to_pen / wolf_to_pen_norm
+                    alignment_to_pen = np.dot(wolf_velocity_normalized, wolf_to_pen_normalized)
+                    
+                    # Check if wolf's vector to pen is opposite (moving away from pen)
+                    if alignment_to_pen < -0.5:  # Moving away from pen
+                        # Check if there's a group of sheep on the opposite side
+                        sheep_behind_count = 0
+                        for sheep_pos in sheep_positions:
+                            wolf_to_sheep = sheep_pos - wolf_pos
+                            dist_to_sheep = np.linalg.norm(wolf_to_sheep)
+                            
+                            if dist_to_sheep > 1.0:
+                                wolf_to_sheep_normalized = wolf_to_sheep / dist_to_sheep
+                                # Check if sheep is behind wolf (opposite to pen direction)
+                                behind_score = np.dot(wolf_velocity_normalized, wolf_to_sheep_normalized)
+                                # Check if sheep is on opposite side of pen direction
+                                sheep_to_pen_alignment = np.dot(wolf_to_sheep_normalized, -wolf_to_pen_normalized)
+                                
+                                # Sheep is behind and on opposite side if:
+                                # - behind_score < -0.3 (behind wolf's movement)
+                                # - sheep_to_pen_alignment > 0.3 (sheep is in direction opposite to pen from wolf)
+                                if behind_score < -0.3 and sheep_to_pen_alignment > 0.3 and dist_to_sheep < 400.0:
+                                    sheep_behind_count += 1
+                        
+                        # If there's a significant group of sheep behind (opposite side), reward
+                        if sheep_behind_count >= 2:  # At least 2 sheep form a group
+                            group_ratio = sheep_behind_count / len(sheep_positions)
+                            # Reward for having sheep group on opposite side while moving away from pen
+                            reward += group_ratio * 0.4
     
     # Small time penalty to encourage action
     reward -= 0.01
