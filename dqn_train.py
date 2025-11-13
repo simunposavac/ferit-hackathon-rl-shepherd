@@ -57,11 +57,11 @@ TRAIN_WOLF = True
 LR = 3e-4           # Learning rate for Q-network
 GAMMA = 0.99        # Discount factor (importance of future rewards)
 TAU = 0.005         # Target network soft-update rate (unused for hard updates)
-BATCH_SIZE = 512    # OPTIMIZED: Large batch size to utilize RTX 3060 fully (was 96)
+BATCH_SIZE = 384    # OPTIMIZED: Large batch size to utilize RTX 3060 (reduced from 512 to prevent slowdown)
 REPLAY_CAPACITY = 500_000  # OPTIMIZED: Larger buffer for more diverse samples (was 250k)
 WARMUP_STEPS = 5_000  # OPTIMIZED: More warmup for better initial samples (was 3k)
 UPDATE_EVERY = 1    # OPTIMIZED: Update every step (was 2) - we do multiple updates per trigger
-MAX_UPDATES_PER_STEP = 4  # OPTIMIZED: Do 4 updates when triggered (utilizes GPU fully)
+MAX_UPDATES_PER_STEP = 2  # OPTIMIZED: Do 2 updates when triggered (reduced from 4 to prevent slowdown)
 TARGET_UPDATE_EVERY = 200  # OPTIMIZED: Update target network every N updates (hard update, was 100)
 EPSILON_START = 1.0  # Initial exploration rate
 EPSILON_END = 0.01   # Final exploration rate
@@ -361,6 +361,11 @@ class DQNAgent(BaseAgent):
             # Do multiple updates to utilize GPU fully
             for _ in range(self.max_updates_per_step):
                 self._update()
+            
+            # Periodic memory cleanup to prevent slowdown (every 100 updates)
+            if self.update_count % 100 == 0 and self.device == 'cuda':
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()  # Ensure GPU operations complete
 
     def _update(self):
         # OPTIMIZED: Sample batch (already on GPU from ReplayBuffer)
@@ -400,6 +405,9 @@ class DQNAgent(BaseAgent):
             with torch.no_grad():
                 for target_param, param in zip(self.target_network.parameters(), self.q_network.parameters()):
                     target_param.data.copy_(param.data)
+        
+        # Clean up intermediate tensors to prevent memory buildup
+        del obs, pen, act, rew, next_obs, next_pen, done, q_values, q_selected, loss
 
     def episode_start(self):
         pass
@@ -407,6 +415,10 @@ class DQNAgent(BaseAgent):
     def episode_end(self, total_reward: float):
         # Decay epsilon
         self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
+        
+        # Periodic GPU memory cleanup after each episode
+        if self.device == 'cuda':
+            torch.cuda.empty_cache()
 
     def save(self, path: str, include_replay: bool = False, max_replay_items: int = 0) -> None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -731,12 +743,13 @@ def train(
     print(f"Action space: {NUM_FORWARD_SPEEDS} forward speeds × {NUM_TURN_RATES} turn rates")
     print()
     print("OPTIMIZATIONS ENABLED:")
-    print(f"  - Batch size: {BATCH_SIZE} (was 96) - Utilizes GPU fully")
+    print(f"  - Batch size: {BATCH_SIZE} (optimized to prevent slowdown)")
     print(f"  - Updates per step: {MAX_UPDATES_PER_STEP} - Multiple updates per trigger")
     print(f"  - Replay buffer: {REPLAY_CAPACITY:,} capacity - More diverse samples")
     print(f"  - Update frequency: Every {UPDATE_EVERY} step(s)")
     print(f"  - Mixed precision: Enabled (AMP)")
     print(f"  - cuDNN benchmark: Enabled")
+    print(f"  - Memory management: Periodic cleanup enabled")
     print(f"  - torch.compile: Disabled (requires Triton - can enable if available)")
     if not headless:
         status = "disabled" if render_every_n_steps == 0 else f"every {render_every_n_steps} steps"
