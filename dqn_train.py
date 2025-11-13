@@ -38,10 +38,10 @@ SAVE_DIR = os.path.join('saves', 'dqn')
 SAVE_EVERY_EPISODES = 20
 
 FOLDER_NAME = os.path.join(SAVE_DIR, datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
-LOAD_DOG_CHECKPOINT = False
+LOAD_DOG_CHECKPOINT = True
 DOG_CHECKPOINT_PATH = r"saves/dqn/best_dog.pth"
 
-LOAD_WOLF_CHECKPOINT = False
+LOAD_WOLF_CHECKPOINT = True
 WOLF_CHECKPOINT_PATH = r"saves/dqn/best_wolf.pth"
 
 

@@ -49,7 +49,7 @@ WOLF_CHECKPOINT_PATH = r"saves/sac/best_wolf.pth"
 # ============================================================================
 
 EPISODES = 1000 # how many episodes to run (Longer - more training, you can checkpoint and resume)
-MAX_STEPS_PER_EPISODE = 2000 # max steps per episode
+MAX_STEPS_PER_EPISODE = 1500 # max steps per episode (reduced for speed)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 TRAIN_DOG = True
@@ -65,16 +65,16 @@ ALPHA_LR = 3e-4      # Temperature learning rate
 
 GAMMA = 0.99         # Discount factor (importance of future rewards)
 TAU = 0.005          # Target network soft-update rate. How fast the target critics track the main critics (0.005 - stable, 0.01 - tracks faster)
-BATCH_SIZE = 128     # [64 - 256] Minibatch size from replay for each SGD step, Bigger = smoother gradients but more VRAM
+BATCH_SIZE = 96      # [64 - 256] Balanced for speed and stability
 REPLAY_CAPACITY = 250_000 # [100k - 500k] Max transitions stored in replay buffer, Larger = more diverse data
-WARMUP_STEPS = 5_000 # Number of env steps collected before any learning (reduced for faster training start)
-STEPS_PER_UPDATE = 4 # Do 1 update every N environment steps (reduced for more frequent updates)
+WARMUP_STEPS = 3_000 # Number of env steps collected before any learning (reduced for faster start)
+STEPS_PER_UPDATE = 2 # Do 1 update every N environment steps (OPTIMIZED: more frequent updates)
 TARGET_ENTROPY = None  # None => will set -action_dim below (-2 for 2D action) (more negative - stronger exploration)
 AUTOMATIC_ENTROPY_TUNING = True # If True, learn temperature α to match TARGET_ENTROPY. (Leave True)
 
 # Rendering
-HEADLESS = False # # hides the window for faster training
-RENDER_EVERY = 0  # 0 disables auto-render
+HEADLESS = False # Window opens but we won't render (still fast!)
+RENDER_EVERY = 0  # 0 disables auto-render - THIS IS KEY FOR SPEED!
 
 # ============================================================================
 # NETWORK ARCHITECTURE
@@ -871,12 +871,12 @@ if __name__ == "__main__":
 
 
     train(
-        num_episodes=1000,
-        max_steps=2000,
+        num_episodes=EPISODES,
+        max_steps=MAX_STEPS_PER_EPISODE,
         save_interval=SAVE_EVERY_EPISODES,
         device=device,
-        headless=False,             # keep window visible by default
-        render_every_n_steps=0,    # render every 20 steps; H toggles 0 ↔ 20
+        headless=HEADLESS,          # Uses config from top (True = faster)
+        render_every_n_steps=RENDER_EVERY,  # Uses config from top (0 = no render)
         render_fps=60,
         log_interval=1,
     )
