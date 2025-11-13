@@ -585,17 +585,118 @@ def dog_reward_fn(info: Dict[str, any], prev_info: Dict[str, any]=None) -> float
     # Dense shaping rewards (help learning when sparse rewards are rare)
     sheep_positions = info.get("sheep_positions", None)
     dog_pos = info.get("dog_position", None)
+    dog_velocity = info.get("dog_velocity", None)
     wolf_pos = info.get("wolf_position", None)
     pen_center = info.get("pen_center", None)
     
     if sheep_positions is not None and len(sheep_positions) > 0 and dog_pos is not None and pen_center is not None:
-        # Reward for being near sheep (herding behavior)
+        # ========================================================================
+        # 1. ALIGNMENT REWARD: Dog's direction aligned with pen direction
+        # ========================================================================
+        if dog_velocity is not None and np.linalg.norm(dog_velocity) > 0.1:
+            # Vector from dog to pen
+            dog_to_pen = pen_center - dog_pos
+            dog_to_pen_norm = np.linalg.norm(dog_to_pen)
+            
+            if dog_to_pen_norm > 1.0:  # Avoid division by zero
+                dog_to_pen_normalized = dog_to_pen / dog_to_pen_norm
+                dog_velocity_normalized = dog_velocity / np.linalg.norm(dog_velocity)
+                
+                # Dot product: 1.0 = perfectly aligned, -1.0 = opposite direction
+                alignment = np.dot(dog_velocity_normalized, dog_to_pen_normalized)
+                # Reward alignment (0 to 1 range, where 1 = perfect alignment)
+                alignment_reward = max(0.0, alignment)  # Only reward positive alignment
+                reward += alignment_reward * 0.25  # Scale factor for alignment reward
+        
+        # ========================================================================
+        # 2. SHEEP IN FRONT OF DOG REWARD
+        # ========================================================================
+        if dog_velocity is not None and np.linalg.norm(dog_velocity) > 0.1:
+            dog_velocity_normalized = dog_velocity / np.linalg.norm(dog_velocity)
+            sheep_in_front_count = 0
+            
+            for sheep_pos in sheep_positions:
+                # Vector from dog to sheep
+                dog_to_sheep = sheep_pos - dog_pos
+                dist_to_sheep = np.linalg.norm(dog_to_sheep)
+                
+                if dist_to_sheep > 1.0:  # Avoid division by zero
+                    dog_to_sheep_normalized = dog_to_sheep / dist_to_sheep
+                    # Dot product: positive = sheep is in front, negative = behind
+                    front_score = np.dot(dog_velocity_normalized, dog_to_sheep_normalized)
+                    
+                    # Consider sheep "in front" if dot product > 0.3 (within ~72 degrees)
+                    # and within reasonable herding distance
+                    if front_score > 0.3 and dist_to_sheep < 300.0:
+                        sheep_in_front_count += 1
+            
+            # Reward for having sheep in front (herding position)
+            if sheep_in_front_count > 0:
+                reward += min(sheep_in_front_count / len(sheep_positions), 1.0) * 0.2
+        
+        # ========================================================================
+        # 3. HERD SIZE REWARD: Larger reward when pushing more sheep toward pen
+        # ========================================================================
         sheep_dists = np.linalg.norm(sheep_positions - dog_pos, axis=1)
+        sheep_dists_to_pen = np.linalg.norm(sheep_positions - pen_center, axis=1)
+        
+        # Count sheep that are:
+        # - Close to dog (within herding range)
+        # - Moving toward pen (or at least not too far)
+        # - In a reasonable herding position
+        herded_sheep_count = 0
+        herd_progress = 0.0
+        
+        if dog_velocity is not None and np.linalg.norm(dog_velocity) > 0.1:
+            dog_velocity_normalized = dog_velocity / np.linalg.norm(dog_velocity)
+            
+            for i, sheep_pos in enumerate(sheep_positions):
+                dist_to_sheep = sheep_dists[i]
+                dist_to_pen = sheep_dists_to_pen[i]
+                
+                # Check if sheep is in herding range
+                if dist_to_sheep < 250.0:  # Within herding distance
+                    # Check if sheep is in front or to the side (not behind)
+                    dog_to_sheep = sheep_pos - dog_pos
+                    if np.linalg.norm(dog_to_sheep) > 1.0:
+                        dog_to_sheep_normalized = dog_to_sheep / np.linalg.norm(dog_to_sheep)
+                        front_score = np.dot(dog_velocity_normalized, dog_to_sheep_normalized)
+                        
+                        # Sheep is being herded if it's in front/side and moving toward pen
+                        if front_score > -0.5:  # Not directly behind
+                            herded_sheep_count += 1
+                            
+                            # Check progress toward pen
+                            if prev_info is not None:
+                                prev_sheep_pos = prev_info.get("sheep_positions", None)
+                                if prev_sheep_pos is not None and len(prev_sheep_pos) == len(sheep_positions):
+                                    # Find matching sheep (by position proximity)
+                                    prev_dists = np.linalg.norm(prev_sheep_pos - sheep_pos, axis=1)
+                                    closest_idx = np.argmin(prev_dists)
+                                    if prev_dists[closest_idx] < 50.0:  # Same sheep
+                                        prev_dist_to_pen = np.linalg.norm(prev_sheep_pos[closest_idx] - pen_center)
+                                        progress = prev_dist_to_pen - dist_to_pen
+                                        if progress > 0:  # Moving toward pen
+                                            herd_progress += progress
+        
+        # Scale reward by herd size (more sheep = larger reward)
+        if herded_sheep_count > 0:
+            herd_size_factor = herded_sheep_count / len(sheep_positions)  # 0 to 1
+            # Base reward for herding, scaled by herd size
+            herd_reward = herd_size_factor * 0.3
+            # Additional reward for progress of the herd
+            if herd_progress > 0:
+                herd_reward += (herd_progress / max(herded_sheep_count, 1)) * 0.2
+            reward += herd_reward
+        
+        # ========================================================================
+        # EXISTING REWARDS (kept for stability)
+        # ========================================================================
         avg_sheep_dist = float(np.mean(sheep_dists))
         min_sheep_dist = float(np.min(sheep_dists))
         
         # Small reward for staying close to sheep cluster
-        reward += (1.0 - min(avg_sheep_dist / 400.0, 1.0)) * 0.15
+        reward += (1.0 - min(avg_sheep_dist / 400.0, 1.0)) * 0.1  # Reduced since we have herd size reward
         
         # Reward for sheep moving toward pen (progress-based shaping)
         if prev_info is not None:
@@ -604,7 +705,7 @@ def dog_reward_fn(info: Dict[str, any], prev_info: Dict[str, any]=None) -> float
                 prev_dists_to_pen = np.linalg.norm(prev_sheep_pos - pen_center, axis=1)
                 curr_dists_to_pen = np.linalg.norm(sheep_positions - pen_center, axis=1)
                 progress = float(np.mean(prev_dists_to_pen - curr_dists_to_pen))
-                reward += progress * 0.16  # Reward progress toward pen
+                reward += progress * 0.12  # Slightly reduced since we have herd progress
         
         # Bonus for positioning between wolf and sheep (protective behavior)
         if wolf_pos is not None and not info.get("wolf_is_dead", False):
@@ -854,7 +955,7 @@ def train(
     if TRAIN_DOG:
         dog_agent.save(f"{FOLDER_NAME}/dog_sac_final.pth")
     if TRAIN_WOLF:
-        wolf_agent.save("{FOLDER_NAME}/wolf_sac_final.pth")
+        wolf_agent.save(f"{FOLDER_NAME}/wolf_sac_final.pth")
     print("\nTraining complete!")
     print(f"Final dog reward (100-ep avg): {np.mean(dog_rewards_history):.2f}")
     print(f"Final wolf reward (100-ep avg): {np.mean(wolf_rewards_history):.2f}")
