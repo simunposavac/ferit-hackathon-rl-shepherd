@@ -44,6 +44,47 @@ DOG_CHECKPOINT_PATH = r"saves/dqn/best_dog.pth"
 LOAD_WOLF_CHECKPOINT = False
 WOLF_CHECKPOINT_PATH = r"saves/dqn/best_wolf.pth"
 
+
+def find_latest_checkpoint(save_dir: str, agent_type: str) -> str | None:
+    """
+    Find the latest checkpoint file for an agent.
+    
+    Args:
+        save_dir: Directory to search (e.g., 'saves/dqn')
+        agent_type: 'dog' or 'wolf'
+    
+    Returns:
+        Path to latest checkpoint or None if not found
+    """
+    if not os.path.exists(save_dir):
+        return None
+    
+    # Pattern: {agent_type}_dqn_episode_{number}.pth or {agent_type}_dqn_final.pth
+    pattern = f"{agent_type}_dqn_episode_*.pth"
+    final_pattern = f"{agent_type}_dqn_final.pth"
+    
+    latest_episode = -1
+    latest_path = None
+    
+    # Search in all subdirectories (timestamp folders)
+    for root, dirs, files in os.walk(save_dir):
+        for file in files:
+            if file == final_pattern.replace('*', ''):
+                # Final checkpoint - prefer this
+                path = os.path.join(root, file)
+                return path
+            elif file.startswith(f"{agent_type}_dqn_episode_") and file.endswith(".pth"):
+                # Extract episode number
+                try:
+                    ep_num = int(file.split("_")[-1].replace(".pth", ""))
+                    if ep_num > latest_episode:
+                        latest_episode = ep_num
+                        latest_path = os.path.join(root, file)
+                except ValueError:
+                    continue
+    
+    return latest_path
+
 # ============================================================================
 # TRAINING CONFIGURATION
 # ============================================================================
@@ -712,8 +753,18 @@ def train(
     if TRAIN_DOG or LOAD_DOG_CHECKPOINT:
         dog_agent = DQNAgent(agent_type="dog", **common_kwargs)
         if LOAD_DOG_CHECKPOINT:
-            print(f"Loading dog checkpoint from: {DOG_CHECKPOINT_PATH}")
-            dog_agent.load(DOG_CHECKPOINT_PATH)
+            # Try to find latest checkpoint if path doesn't exist
+            if not os.path.exists(DOG_CHECKPOINT_PATH):
+                latest = find_latest_checkpoint(SAVE_DIR, "dog")
+                if latest:
+                    print(f"Specified checkpoint not found. Using latest: {latest}")
+                    dog_agent.load(latest)
+                else:
+                    print(f"Warning: No checkpoint found at {DOG_CHECKPOINT_PATH} and no latest checkpoint found.")
+                    print("Starting training from scratch.")
+            else:
+                print(f"Loading dog checkpoint from: {DOG_CHECKPOINT_PATH}")
+                dog_agent.load(DOG_CHECKPOINT_PATH)
             print("Dog checkpoint loaded successfully!")
     else:
         dog_agent = RandomAgent(agent_type="dog", max_value=0)
@@ -721,8 +772,18 @@ def train(
     if TRAIN_WOLF or LOAD_WOLF_CHECKPOINT:
         wolf_agent = DQNAgent(agent_type="wolf", **common_kwargs)
         if LOAD_WOLF_CHECKPOINT:
-            print(f"Loading wolf checkpoint from: {WOLF_CHECKPOINT_PATH}")
-            wolf_agent.load(WOLF_CHECKPOINT_PATH)
+            # Try to find latest checkpoint if path doesn't exist
+            if not os.path.exists(WOLF_CHECKPOINT_PATH):
+                latest = find_latest_checkpoint(SAVE_DIR, "wolf")
+                if latest:
+                    print(f"Specified checkpoint not found. Using latest: {latest}")
+                    wolf_agent.load(latest)
+                else:
+                    print(f"Warning: No checkpoint found at {WOLF_CHECKPOINT_PATH} and no latest checkpoint found.")
+                    print("Starting training from scratch.")
+            else:
+                print(f"Loading wolf checkpoint from: {WOLF_CHECKPOINT_PATH}")
+                wolf_agent.load(WOLF_CHECKPOINT_PATH)
             print("Wolf checkpoint loaded successfully!")
     else:
         wolf_agent = RandomAgent(agent_type="wolf", max_value=0)
