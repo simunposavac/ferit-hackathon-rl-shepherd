@@ -43,6 +43,58 @@ DOG_CHECKPOINT_PATH = r"saves/sac/best_dog.pth"
 
 LOAD_WOLF_CHECKPOINT = True
 WOLF_CHECKPOINT_PATH = r"saves/sac/best_wolf.pth"
+LOAD_WOLF_CHECKPOINT = False
+WOLF_CHECKPOINT_PATH = r"saves/sac/best_wolf.pth"  # Fallback if find_latest_checkpoint returns None
+
+
+def find_latest_checkpoint(save_dir: str, agent_type: str) -> str | None:
+    """
+    Find the latest checkpoint file for an agent by searching all timestamped folders.
+    Prefers the most recently modified checkpoint (by file modification time).
+    
+    Args:
+        save_dir: Directory to search (e.g., 'saves/sac')
+        agent_type: 'dog' or 'wolf'
+    
+    Returns:
+        Path to latest checkpoint or None if not found
+    """
+    if not os.path.exists(save_dir):
+        return None
+    
+    # Pattern: {agent_type}_sac_episode_{number}.pth or {agent_type}_sac_final.pth
+    final_pattern = f"{agent_type}_sac_final.pth"
+    
+    all_checkpoints = []  # List of (path, episode_num, mtime, is_final)
+    
+    # Search in all subdirectories (timestamp folders)
+    for root, dirs, files in os.walk(save_dir):
+        for file in files:
+            path = os.path.join(root, file)
+            if not os.path.exists(path):
+                continue
+                
+            mtime = os.path.getmtime(path)
+            
+            if file == final_pattern:
+                # Final checkpoint - treat as episode number 999999 for sorting
+                all_checkpoints.append((path, 999999, mtime, True))
+            elif file.startswith(f"{agent_type}_sac_episode_") and file.endswith(".pth"):
+                # Extract episode number
+                try:
+                    ep_num = int(file.split("_")[-1].replace(".pth", ""))
+                    all_checkpoints.append((path, ep_num, mtime, False))
+                except ValueError:
+                    continue
+    
+    if not all_checkpoints:
+        return None
+    
+    # Sort by: 1) modification time (newest first), 2) episode number (higher first)
+    # This ensures we get the most recently saved checkpoint
+    all_checkpoints.sort(key=lambda x: (x[2], x[1]), reverse=True)
+    
+    return all_checkpoints[0][0]
 
 def find_latest_checkpoint(save_dir: str, agent_type: str) -> str | None:
     """
@@ -948,6 +1000,18 @@ def train(
                 print(f"Loading dog checkpoint from: {DOG_CHECKPOINT_PATH}")
                 dog_agent.load(DOG_CHECKPOINT_PATH)
             print("Dog checkpoint loaded successfully!")
+            # Try to find latest checkpoint, fallback to hardcoded path
+            checkpoint_path = find_latest_checkpoint(SAVE_DIR, "dog")
+            if checkpoint_path is None:
+                checkpoint_path = DOG_CHECKPOINT_PATH
+                if not os.path.exists(checkpoint_path):
+                    print(f"Warning: Checkpoint not found at {checkpoint_path}, starting from scratch")
+                    checkpoint_path = None
+            
+            if checkpoint_path:
+                print(f"Loading dog checkpoint from: {checkpoint_path}")
+                dog_agent.load(checkpoint_path)
+                print("Dog checkpoint loaded successfully!")
     else:
         dog_agent = RandomAgent(agent_type="dog", max_value=0)
 
@@ -966,6 +1030,18 @@ def train(
                 print(f"Loading Wolf checkpoint from: {WOLF_CHECKPOINT_PATH}")
                 wolf_agent.load(WOLF_CHECKPOINT_PATH)
             print("Wolf checkpoint loaded successfully!")
+            # Try to find latest checkpoint, fallback to hardcoded path
+            checkpoint_path = find_latest_checkpoint(SAVE_DIR, "wolf")
+            if checkpoint_path is None:
+                checkpoint_path = WOLF_CHECKPOINT_PATH
+                if not os.path.exists(checkpoint_path):
+                    print(f"Warning: Checkpoint not found at {checkpoint_path}, starting from scratch")
+                    checkpoint_path = None
+            
+            if checkpoint_path:
+                print(f"Loading wolf checkpoint from: {checkpoint_path}")
+                wolf_agent.load(checkpoint_path)
+                print("Wolf checkpoint loaded successfully!")
     else:
         wolf_agent = RandomAgent(agent_type="wolf", max_value=0)
 
