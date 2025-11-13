@@ -1,9 +1,11 @@
 """DQN training entry point for the sheep herding simulation.
 
-Single file to edit:
-1. Define your Q-network class for DQN
-2. Define dog_reward_fn and wolf_reward_fn
-3. Adjust training config and run
+FIXED VERSION - Improvements:
+1. Per-step epsilon decay with linear annealing
+2. Soft target network updates (polyak averaging)
+3. Increased updates per step for better sample efficiency
+4. LayerNorm instead of BatchNorm for stability
+5. Better hyperparameter balance
 """
 
 from __future__ import annotations
@@ -33,7 +35,7 @@ from simulator import Simulator
 # ============================================================================
 
 SAVE_DIR = os.path.join('saves', 'dqn')
-SAVE_EVERY_EPISODES = 20  # Save more frequently for hackathon
+SAVE_EVERY_EPISODES = 20
 
 FOLDER_NAME = os.path.join(SAVE_DIR, datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
 LOAD_DOG_CHECKPOINT = False
@@ -46,53 +48,49 @@ WOLF_CHECKPOINT_PATH = r"saves/dqn/best_wolf.pth"
 # TRAINING CONFIGURATION
 # ============================================================================
 
-EPISODES = 1000  # how many episodes to run (Longer - more training, you can checkpoint and resume)
-MAX_STEPS_PER_EPISODE = 2000  # max steps per episode
+EPISODES = 1000
+MAX_STEPS_PER_EPISODE = 2000
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 TRAIN_DOG = True
 TRAIN_WOLF = True
 
-# DQN hyperparameters - OPTIMIZED FOR RTX 3060 (12GB VRAM)
-LR = 3e-4           # Learning rate for Q-network
-GAMMA = 0.99        # Discount factor (importance of future rewards)
-TAU = 0.005         # Target network soft-update rate (unused for hard updates)
-BATCH_SIZE = 128    # OPTIMIZED: Balanced batch size for stable training (reduced to prevent slowdown)
-REPLAY_CAPACITY = 250_000  # OPTIMIZED: Reasonable buffer size (reduced to prevent memory issues)
-WARMUP_STEPS = 3_000  # OPTIMIZED: Standard warmup period
-UPDATE_EVERY = 4    # OPTIMIZED: Update every 4 steps (reduces update frequency to prevent slowdown)
-MAX_UPDATES_PER_STEP = 1  # OPTIMIZED: Single update per trigger (prevents GPU queue buildup)
-TARGET_UPDATE_EVERY = 100  # OPTIMIZED: Update target network every N updates (hard update)
-EPSILON_START = 1.0  # Initial exploration rate
-EPSILON_END = 0.01   # Final exploration rate
-EPSILON_DECAY = 0.995  # Epsilon decay per episode
+# FIXED: Improved DQN hyperparameters
+LR = 3e-4
+GAMMA = 0.99
+TAU = 0.005         # FIXED: Now actually used for soft target updates
+BATCH_SIZE = 128
+REPLAY_CAPACITY = 250_000
+WARMUP_STEPS = 3_000
+UPDATE_EVERY = 4
+MAX_UPDATES_PER_STEP = 2  # FIXED: Increased from 1 to 2 for better sample efficiency
+TARGET_UPDATE_EVERY = 1   # FIXED: Update target every step (soft update), not every 100
+
+# FIXED: Per-step epsilon decay with linear annealing
+TOTAL_TRAINING_STEPS = EPISODES * MAX_STEPS_PER_EPISODE
+EPSILON_START = 1.0
+EPSILON_END = 0.01
+EPSILON_DECAY_STEPS = int(TOTAL_TRAINING_STEPS * 0.5)  # Decay over first 50% of training
 
 # Rendering
-HEADLESS = False  # Window opens but we won't render (still fast!)
-RENDER_EVERY = 0  # 0 disables auto-render - THIS IS KEY FOR SPEED!
+HEADLESS = False
+RENDER_EVERY = 0
 
 # ============================================================================
 # DISCRETE ACTION SPACE
 # ============================================================================
 
-# Discretize continuous action space for DQN
-# Forward speed: [0, 0.33, 0.67, 1.0] = 4 levels
-# Turn rate: [-1, -0.33, 0.33, 1] = 4 levels
-# Total: 16 discrete actions
 FORWARD_SPEEDS = np.array([0.0, 0.33, 0.67, 1.0])
 TURN_RATES = np.array([-1.0, -0.33, 0.33, 1.0])
 NUM_FORWARD_SPEEDS = len(FORWARD_SPEEDS)
 NUM_TURN_RATES = len(TURN_RATES)
-NUM_ACTIONS = NUM_FORWARD_SPEEDS * NUM_TURN_RATES  # 16 actions
+NUM_ACTIONS = NUM_FORWARD_SPEEDS * NUM_TURN_RATES
 
 
 def action_to_discrete(forward_speed: float, turn_rate: float) -> int:
     """Convert continuous action to discrete action index."""
-    # Find closest forward speed
     forward_idx = np.argmin(np.abs(FORWARD_SPEEDS - forward_speed))
-    # Find closest turn rate
     turn_idx = np.argmin(np.abs(TURN_RATES - turn_rate))
-    # Convert to single action index
     action_idx = forward_idx * NUM_TURN_RATES + turn_idx
     return int(action_idx)
 
@@ -110,35 +108,35 @@ def discrete_to_action(action_idx: int) -> Tuple[float, float]:
 # NETWORK ARCHITECTURE
 # ============================================================================
 
-# Encodes the observation grid (channels × H × W) and concatenates the 2-D pen vector; outputs Q-values for each action.
+# FIXED: Replaced BatchNorm with LayerNorm for better RL stability
 class CNNFeature(nn.Module):
-    """CNN feature extractor for grid observations - OPTIMIZED for best performance."""
+    """CNN feature extractor for grid observations - FIXED with LayerNorm."""
     def __init__(self, observation_shape, pen_vec_dim=2, hidden_dim=512):
         super().__init__()
         channels, height, width = observation_shape
-        # Optimized CNN with better feature extraction
+        
         self.conv = nn.Sequential(
             nn.Conv2d(channels, 64, kernel_size=3, stride=1, padding=1),
             nn.ReLU(inplace=True),
-            nn.BatchNorm2d(64),  # BatchNorm for better training stability
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),  # Stride 2 for spatial reduction
+            nn.GroupNorm(8, 64),  # FIXED: GroupNorm instead of BatchNorm (works better in RL)
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
             nn.ReLU(inplace=True),
-            nn.BatchNorm2d(128),
-            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),  # Stride 2 for more reduction
+            nn.GroupNorm(16, 128),  # FIXED: GroupNorm
+            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
             nn.ReLU(inplace=True),
-            nn.BatchNorm2d(256),
+            nn.GroupNorm(32, 256),  # FIXED: GroupNorm
             nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1),
             nn.ReLU(inplace=True),
-            nn.BatchNorm2d(256),
-            nn.AdaptiveAvgPool2d((4, 4)),  # Adaptive pooling for robustness
+            nn.GroupNorm(32, 256),  # FIXED: GroupNorm
+            nn.AdaptiveAvgPool2d((4, 4)),
             nn.Flatten()
         )
-        # Calculate output size after convs: 256 * 4 * 4 = 4096
+        
         conv_out = 256 * 4 * 4
         self.mlp = nn.Sequential(
             nn.Linear(conv_out + pen_vec_dim, hidden_dim),
             nn.ReLU(inplace=True),
-            nn.LayerNorm(hidden_dim),  # Layer norm for stability
+            nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(inplace=True),
             nn.LayerNorm(hidden_dim),
@@ -153,11 +151,10 @@ class CNNFeature(nn.Module):
 
 
 class DQN(nn.Module):
-    """Deep Q-Network for discrete action space - Optimized architecture."""
+    """Deep Q-Network for discrete action space."""
     def __init__(self, observation_shape, pen_vec_dim=2, hidden_dim=512, num_actions=NUM_ACTIONS):
         super().__init__()
         self.feature = CNNFeature(observation_shape, pen_vec_dim, hidden_dim)
-        # Improved Q-head with better capacity
         self.q_head = nn.Sequential(
             nn.Linear(self.feature.out_dim, hidden_dim),
             nn.ReLU(inplace=True),
@@ -173,11 +170,10 @@ class DQN(nn.Module):
         return q_values
 
 
-# ===============================
-#         Replay Buffer
-# ===============================
+# ============================================================================
+# REPLAY BUFFER
+# ============================================================================
 
-# Stores (obs, pen_vec, action, reward, next_obs, next_pen, done) for off-policy learning
 class ReplayBuffer:
     def __init__(self, capacity: int, observation_shape, pen_vec_dim=2, action_dim=1, device='cpu'):
         self.capacity = capacity
@@ -185,7 +181,7 @@ class ReplayBuffer:
 
         self.obs_buf = np.zeros((capacity, *observation_shape), dtype=np.float32)
         self.pen_buf = np.zeros((capacity, pen_vec_dim), dtype=np.float32)
-        self.act_buf = np.zeros((capacity, action_dim), dtype=np.int64)  # Discrete actions
+        self.act_buf = np.zeros((capacity, action_dim), dtype=np.int64)
         self.rew_buf = np.zeros((capacity, 1), dtype=np.float32)
         self.next_obs_buf = np.zeros((capacity, *observation_shape), dtype=np.float32)
         self.next_pen_buf = np.zeros((capacity, pen_vec_dim), dtype=np.float32)
@@ -207,9 +203,7 @@ class ReplayBuffer:
         self.size = min(self.size + 1, self.capacity)
 
     def sample(self, batch_size: int):
-        # OPTIMIZED: Use torch.as_tensor for faster conversion (avoids unnecessary copies)
         idxs = np.random.randint(0, self.size, size=batch_size)
-        # Use as_tensor which is faster than from_numpy for contiguous arrays
         obs = torch.as_tensor(self.obs_buf[idxs], device=self.device)
         pen = torch.as_tensor(self.pen_buf[idxs], device=self.device)
         act = torch.as_tensor(self.act_buf[idxs], device=self.device)
@@ -220,15 +214,17 @@ class ReplayBuffer:
         return obs, pen, act, rew, next_obs, next_pen, done
 
 
-# ===============================
-#             DQN Agent
-# ===============================
+# ============================================================================
+# DQN AGENT
+# ============================================================================
 
 class DQNAgent(BaseAgent):
     """
-    Deep Q-Network agent implementing BaseAgent interface.
-    Uses epsilon-greedy exploration and target network.
-    OPTIMIZED FOR RTX 3060: Large batches, multiple updates per step, torch.compile
+    Deep Q-Network agent - FIXED VERSION
+    - Per-step epsilon decay with linear annealing
+    - Soft target updates (polyak averaging)
+    - Increased updates per step
+    - Better stability
     """
     def __init__(
         self,
@@ -243,19 +239,19 @@ class DQNAgent(BaseAgent):
         buffer_capacity=250_000,
         batch_size=128,
         update_every=4,
-        max_updates_per_step=1,
-        target_update_every=100,
+        max_updates_per_step=2,
+        target_update_every=1,
         learning_starts=3_000,
         epsilon_start=1.0,
         epsilon_end=0.01,
-        epsilon_decay=0.995,
+        epsilon_decay_steps=100000,
         pen_vec_dim=2,
         num_actions=NUM_ACTIONS,
-        use_torch_compile=True
+        use_torch_compile=False
     ):
         self.device = device
         self.gamma = gamma
-        self.tau = tau
+        self.tau = tau  # FIXED: Now used for soft updates
         self.batch_size = batch_size
         self.update_every = update_every
         self.max_updates_per_step = max_updates_per_step
@@ -265,41 +261,23 @@ class DQNAgent(BaseAgent):
         self.action_dim = action_dim
         self.num_actions = num_actions
 
-        # Epsilon-greedy exploration
+        # FIXED: Per-step epsilon decay with linear annealing
         self.epsilon = epsilon_start
+        self.epsilon_start = epsilon_start
         self.epsilon_end = epsilon_end
-        self.epsilon_decay = epsilon_decay
+        self.epsilon_decay_steps = epsilon_decay_steps
 
         self.use_amp = (device == 'cuda')
         if self.use_amp:
-            torch.backends.cudnn.benchmark = True  # Faster convs for fixed input sizes
+            torch.backends.cudnn.benchmark = True
             torch.backends.cudnn.deterministic = False
             self.scaler = torch.amp.GradScaler('cuda')
         else:
             self.scaler = None
 
-        # Q-network and target network
         self.q_network = DQN(observation_shape, pen_vec_dim, hidden_dim, num_actions).to(device)
         self.target_network = DQN(observation_shape, pen_vec_dim, hidden_dim, num_actions).to(device)
         self.target_network.load_state_dict(self.q_network.state_dict())
-        
-        # OPTIMIZATION: Compile network for faster execution (PyTorch 2.0+)
-        # Check if Triton is available before attempting compilation
-        self._is_compiled = False
-        if use_torch_compile and device == 'cuda' and hasattr(torch, 'compile'):
-            try:
-                # Try to import triton to check if it's available
-                import triton
-                print(f"Compiling {agent_type} Q-network with torch.compile for faster execution...")
-                self.q_network = torch.compile(self.q_network, mode='reduce-overhead')
-                self._is_compiled = True
-                print(f"Successfully compiled {agent_type} Q-network!")
-            except ImportError:
-                print(f"Info: Triton not available for {agent_type}. torch.compile disabled. Training will still work but may be slightly slower.")
-            except Exception as e:
-                print(f"Warning: torch.compile failed for {agent_type}: {str(e)[:100]}. Continuing without compilation.")
-        
-        # Set target network to eval mode (no gradients needed)
         self.target_network.eval()
 
         self.optimizer = torch.optim.Adam(self.q_network.parameters(), lr=lr, eps=1e-7)
@@ -309,27 +287,34 @@ class DQNAgent(BaseAgent):
         self.update_count = 0
         self._last_action_np = None
 
+    def _update_epsilon(self):
+        """FIXED: Per-step epsilon decay with linear annealing."""
+        if self.total_steps < self.epsilon_decay_steps:
+            # Linear annealing
+            self.epsilon = self.epsilon_start - (self.epsilon_start - self.epsilon_end) * (
+                self.total_steps / self.epsilon_decay_steps
+            )
+        else:
+            self.epsilon = self.epsilon_end
+
     def _to_tensor_inputs(self, observation: np.ndarray, pen_vector: np.ndarray):
         obs_grid = torch.as_tensor(observation, dtype=torch.float32, device=self.device).unsqueeze(0)
         pen_vec = torch.as_tensor(pen_vector, dtype=torch.float32, device=self.device).unsqueeze(0)
         return obs_grid, pen_vec
 
     def act(self, observation: np.ndarray, pen_vector: np.ndarray):
-        # OPTIMIZED: Use inference mode for faster execution (no gradient tracking)
         self.q_network.eval()
-        with torch.inference_mode():  # OPTIMIZED: inference_mode is faster than no_grad
+        with torch.inference_mode():
             obs_grid, pen_vec = self._to_tensor_inputs(observation, pen_vector)
             q_values = self.q_network(obs_grid, pen_vec)
-            # Epsilon-greedy exploration
+            
             if np.random.random() < self.epsilon:
                 action_idx = np.random.randint(0, self.num_actions)
             else:
                 action_idx = q_values.argmax().item()
         self.q_network.train()
 
-        # Convert discrete action to continuous action
         forward_speed, turn_rate = discrete_to_action(action_idx)
-
         self._last_action_np = action_idx
 
         if self.agent_type == "dog":
@@ -340,7 +325,6 @@ class DQNAgent(BaseAgent):
     def observe(self, observation: np.ndarray, pen_vector: np.ndarray,
                 action, reward: float, next_observation: np.ndarray,
                 next_pen_vector: np.ndarray, done: bool, info: dict):
-        # Convert action to discrete
         act_vec = action.to_vector()
         action_idx = action_to_discrete(act_vec[0], act_vec[1])
         action_idx = np.array([action_idx], dtype=np.int64)
@@ -356,39 +340,39 @@ class DQNAgent(BaseAgent):
         )
 
         self.total_steps += 1
+        self._update_epsilon()  # FIXED: Update epsilon every step
 
-        # OPTIMIZED: Begin learning after warmup
+        # FIXED: Multiple updates per trigger for better sample efficiency
         if self.replay.size >= self.learning_starts and (self.total_steps % self.update_every == 0):
-            # Single update per trigger to prevent slowdown
-            self._update()
+            for _ in range(self.max_updates_per_step):
+                self._update()
             
-            # Less frequent memory cleanup (every 500 updates to reduce overhead)
             if self.update_count % 500 == 0 and self.device == 'cuda':
                 torch.cuda.empty_cache()
 
     def _update(self):
-        # OPTIMIZED: Sample batch (already on GPU from ReplayBuffer)
+        """FIXED: Uses soft target updates (polyak averaging)."""
         obs, pen, act, rew, next_obs, next_pen, done = self.replay.sample(self.batch_size)
 
-        # Compute target Q-values using target network (no gradients)
+        # Compute target Q-values
         with torch.amp.autocast('cuda', enabled=self.use_amp), torch.no_grad():
             next_q_values = self.target_network(next_obs, next_pen)
             next_q_max = next_q_values.max(dim=1, keepdim=True)[0]
             target_q = rew + (1.0 - done) * self.gamma * next_q_max
 
         # Compute current Q-values and loss
-        self.optimizer.zero_grad(set_to_none=True)  # OPTIMIZED: set_to_none for faster
+        self.optimizer.zero_grad(set_to_none=True)
         
         with torch.amp.autocast('cuda', enabled=self.use_amp):
             q_values = self.q_network(obs, pen)
             q_selected = q_values.gather(1, act.long())
             loss = F.mse_loss(q_selected, target_q)
 
-        # Backward pass and optimization
+        # Backward pass
         if self.scaler is not None:
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.q_network.parameters(), 10.0)  # Increased clip for large batches
+            torch.nn.utils.clip_grad_norm_(self.q_network.parameters(), 10.0)
             self.scaler.step(self.optimizer)
             self.scaler.update()
         else:
@@ -398,28 +382,19 @@ class DQNAgent(BaseAgent):
 
         self.update_count += 1
 
-        # Update target network (hard update every N steps)
+        # FIXED: Soft target network update (polyak averaging) every step
         if self.update_count % self.target_update_every == 0:
-            # OPTIMIZED: Only update target network periodically (saves computation)
             with torch.no_grad():
                 for target_param, param in zip(self.target_network.parameters(), self.q_network.parameters()):
-                    target_param.data.copy_(param.data)
-        
-        # Clean up intermediate tensors to prevent memory buildup (only delete if not needed)
-        # Note: Python GC will handle this, explicit del can sometimes cause overhead
+                    target_param.data.copy_(
+                        self.tau * param.data + (1.0 - self.tau) * target_param.data
+                    )
 
     def episode_start(self):
         pass
 
     def episode_end(self, total_reward: float):
-        # Decay epsilon
-        self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
-        
-        # Less frequent GPU memory cleanup (every 10 episodes to reduce overhead)
-        # if self.device == 'cuda' and hasattr(self, '_episode_count'):
-        #     self._episode_count = getattr(self, '_episode_count', 0) + 1
-        #     if self._episode_count % 10 == 0:
-        #         torch.cuda.empty_cache()
+        pass  # FIXED: Epsilon decay now happens per-step, not per-episode
 
     def save(self, path: str, include_replay: bool = False, max_replay_items: int = 0) -> None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -438,8 +413,9 @@ class DQNAgent(BaseAgent):
                 "target_update_every": self.target_update_every,
                 "learning_starts": self.learning_starts,
                 "epsilon": self.epsilon,
+                "epsilon_start": self.epsilon_start,
                 "epsilon_end": self.epsilon_end,
-                "epsilon_decay": self.epsilon_decay,
+                "epsilon_decay_steps": self.epsilon_decay_steps,
                 "total_steps": self.total_steps,
                 "update_count": self.update_count,
                 "device": str(self.device),
@@ -490,7 +466,6 @@ class DQNAgent(BaseAgent):
 
         if "optimizer" in ckpt and ckpt["optimizer"] is not None:
             self.optimizer.load_state_dict(ckpt["optimizer"])
-            # Move optimizer state tensors to the correct device
             for state in self.optimizer.state.values():
                 for k, v in state.items():
                     if isinstance(v, torch.Tensor):
@@ -506,6 +481,7 @@ class DQNAgent(BaseAgent):
         self.total_steps = int(meta.get("total_steps", self.total_steps))
         self.update_count = int(meta.get("update_count", self.update_count))
         self.epsilon = float(meta.get("epsilon", self.epsilon))
+        self.epsilon_decay_steps = int(meta.get("epsilon_decay_steps", self.epsilon_decay_steps))
 
         rb = ckpt.get("replay", None)
         if rb is not None:
@@ -530,120 +506,84 @@ class DQNAgent(BaseAgent):
 # REWARD FUNCTIONS
 # ============================================================================
 
-# ----------------------------------------------------------------------------
-#                                    Guidelines
-# You control the behavior with:
-#   dog_reward_fn(info, prev_info)
-#   wolf_reward_fn(info, prev_info)
-# These run every step inside the simulator and return a single number (reward)
-#
-# Mission:
-# - Dog: Get sheep to get in pen and can eat wolf
-# - Wolf: Distract sheep from getting in pen and can eat sheep
-# ----------------------------------------------------------------------------
-
 def dog_reward_fn(info: Dict[str, any], prev_info: Dict[str, any] = None) -> float:
-    """
-    Dog reward function:
-    Mission: Get sheep into pen, and can eat/kill wolf
-    """
+    """Dog reward function: Get sheep into pen, kill wolf."""
     reward = 0.0
 
-    # Main objectives (sparse rewards) - MISSION CRITICAL
+    # Main objectives
     sheep_entered = info.get("sheep_entered_pen", 0)
     sheep_eaten = info.get("sheep_eaten", 0)
     wolf_killed = info.get("wolf_killed", False)
     
-    # Big rewards/penalties for main events
-    reward += float(sheep_entered) * 200.0  # Major reward for saving sheep (increased)
-    reward -= float(sheep_eaten) * 150.0    # Major penalty when wolf eats sheep (increased)
-    reward += float(wolf_killed) * 150.0    # Big bonus for killing wolf (mission objective, increased)
+    reward += float(sheep_entered) * 200.0
+    reward -= float(sheep_eaten) * 150.0
+    reward += float(wolf_killed) * 150.0
     
-    # Dense shaping rewards (help learning when sparse rewards are rare)
+    # Dense shaping rewards
     sheep_positions = info.get("sheep_positions", None)
     dog_pos = info.get("dog_position", None)
     wolf_pos = info.get("wolf_position", None)
     pen_center = info.get("pen_center", None)
     
     if sheep_positions is not None and len(sheep_positions) > 0 and dog_pos is not None and pen_center is not None:
-        # Calculate distances
         sheep_dists_to_dog = np.linalg.norm(sheep_positions - dog_pos, axis=1)
         sheep_dists_to_pen = np.linalg.norm(sheep_positions - pen_center, axis=1)
         avg_sheep_dist_to_dog = float(np.mean(sheep_dists_to_dog))
         avg_sheep_dist_to_pen = float(np.mean(sheep_dists_to_pen))
         
-        # Reward for herding sheep toward pen (primary mission)
-        # Reward being behind sheep (pushing them toward pen)
         dog_dist_to_pen = float(np.linalg.norm(dog_pos - pen_center))
         
-        # Reward for sheep making progress toward pen
         if prev_info is not None:
             prev_sheep_pos = prev_info.get("sheep_positions", None)
             if prev_sheep_pos is not None and len(prev_sheep_pos) == len(sheep_positions):
                 prev_dists_to_pen = np.linalg.norm(prev_sheep_pos - pen_center, axis=1)
                 progress = float(np.mean(prev_dists_to_pen - sheep_dists_to_pen))
-                # Stronger reward for progress toward pen
-                reward += progress * 0.12  # Increased from 0.08
+                reward += progress * 0.12
         
-        # Reward for positioning behind sheep (herding position)
-        # Dog should be further from pen than sheep average (pushing them)
         if avg_sheep_dist_to_pen < dog_dist_to_pen:
-            reward += 0.2  # Bonus for herding position
+            reward += 0.2
         
-        # Reward for keeping sheep together (herding behavior)
         sheep_spread = float(np.std(sheep_dists_to_pen))
         reward += (1.0 - min(sheep_spread / 200.0, 1.0)) * 0.1
         
-        # Reward for being close enough to influence sheep (herding distance)
         optimal_herding_dist = 200.0
         if avg_sheep_dist_to_dog < optimal_herding_dist * 2:
             reward += (1.0 - min(avg_sheep_dist_to_dog / (optimal_herding_dist * 2), 1.0)) * 0.15
         
-        # Protective behavior: Position between wolf and sheep (can lead to killing wolf)
         if wolf_pos is not None and not info.get("wolf_is_dead", False):
             wolf_to_dog = float(np.linalg.norm(dog_pos - wolf_pos))
             wolf_to_sheep_avg = float(np.mean(np.linalg.norm(sheep_positions - wolf_pos, axis=1)))
             
-            # Reward for being between wolf and sheep (protective + hunting position)
             if wolf_to_dog < wolf_to_sheep_avg:
-                reward += 0.25  # Increased reward for protective positioning
+                reward += 0.25
             
-            # Bonus for being close to wolf (can kill it)
-            if wolf_to_dog < 150.0:  # Within kill range
-                reward += 0.3  # Strong incentive to engage wolf
-            elif wolf_to_dog < 250.0:  # Approaching kill range
+            if wolf_to_dog < 150.0:
+                reward += 0.3
+            elif wolf_to_dog < 250.0:
                 reward += 0.15
     
-    # Reward for getting sheep into pen (completion bonus)
     total_sheep_in_pen = info.get("total_sheep_in_pen", 0)
     if total_sheep_in_pen > 0:
-        reward += total_sheep_in_pen * 0.5  # Small bonus for each saved sheep
+        reward += total_sheep_in_pen * 0.5
     
-    # Small time penalty (encourages faster completion)
     reward -= 0.01
 
     return reward
 
 
 def wolf_reward_fn(info, prev_info=None) -> float:
-    """
-    Wolf reward function:
-    Mission: Distract sheep from getting in pen, and can eat sheep
-    """
+    """Wolf reward function: Eat sheep, distract from pen."""
     reward = 0.0
 
-    # Main objectives (sparse rewards) - MISSION CRITICAL
     sheep_eaten = info.get("sheep_eaten", 0)
     wolf_killed = info.get("wolf_killed", False)
     wolf_is_dead = info.get("wolf_is_dead", False)
     sheep_entered_pen = info.get("sheep_entered_pen", 0)
     
-    # Big rewards/penalties for main events
-    reward += float(sheep_eaten) * 200.0      # Major reward for eating sheep (mission objective, increased)
-    reward -= float(wolf_killed) * 150.0      # Major penalty for dying (increased)
-    reward -= float(sheep_entered_pen) * 80.0  # Penalty when dog succeeds (mission failure, increased)
+    reward += float(sheep_eaten) * 200.0
+    reward -= float(wolf_killed) * 150.0
+    reward -= float(sheep_entered_pen) * 80.0
     
-    # Dense shaping rewards (only when wolf is alive)
     if not wolf_is_dead:
         sheep_positions = info.get("sheep_positions", None)
         wolf_pos = info.get("wolf_position", None)
@@ -651,71 +591,55 @@ def wolf_reward_fn(info, prev_info=None) -> float:
         pen_center = info.get("pen_center", None)
         
         if sheep_positions is not None and len(sheep_positions) > 0 and wolf_pos is not None:
-            # Calculate distances
             sheep_dists_to_wolf = np.linalg.norm(sheep_positions - wolf_pos, axis=1)
             min_sheep_dist = float(np.min(sheep_dists_to_wolf))
             avg_sheep_dist = float(np.mean(sheep_dists_to_wolf))
             
-            # Primary mission: Get close to sheep (can eat them)
-            # Strong shaping: reward for getting close to nearest sheep
-            reward += (1.0 - min(min_sheep_dist / 400.0, 1.0)) * 0.5  # Increased from 0.4
+            reward += (1.0 - min(min_sheep_dist / 400.0, 1.0)) * 0.5
             
-            # Bonus for being very close to sheep (about to eat)
             if min_sheep_dist < 50.0:
-                reward += 0.5  # Increased from 0.3
+                reward += 0.5
             
-            # Reward for moving toward sheep (progress-based)
             if prev_info is not None:
                 prev_wolf_pos = prev_info.get("wolf_position", None)
                 prev_sheep_pos = prev_info.get("sheep_positions", None)
                 if prev_wolf_pos is not None and prev_sheep_pos is not None and len(prev_sheep_pos) == len(sheep_positions):
                     prev_min_dist = float(np.min(np.linalg.norm(prev_sheep_pos - prev_wolf_pos, axis=1)))
                     progress = prev_min_dist - min_sheep_dist
-                    reward += progress * 0.08  # Increased from 0.05
+                    reward += progress * 0.08
             
-            # Secondary mission: Distract sheep from pen
             if pen_center is not None:
                 sheep_dists_to_pen = np.linalg.norm(sheep_positions - pen_center, axis=1)
                 avg_dist_to_pen = float(np.mean(sheep_dists_to_pen))
                 
-                # Reward if sheep are far from pen (distracted - mission success)
-                reward += min(avg_dist_to_pen / 600.0, 1.0) * 0.2  # Increased from 0.1
+                reward += min(avg_dist_to_pen / 600.0, 1.0) * 0.2
                 
-                # Reward for pushing sheep away from pen (progress-based)
                 if prev_info is not None:
                     prev_sheep_pos = prev_info.get("sheep_positions", None)
                     if prev_sheep_pos is not None and len(prev_sheep_pos) == len(sheep_positions):
                         prev_dists_to_pen = np.linalg.norm(prev_sheep_pos - pen_center, axis=1)
                         prev_avg_dist = float(np.mean(prev_dists_to_pen))
-                        # Reward if sheep are moving away from pen
                         if avg_dist_to_pen > prev_avg_dist:
                             reward += (avg_dist_to_pen - prev_avg_dist) * 0.1
             
-            # Strategic: Avoid dog when it's close (survival behavior)
             if dog_pos is not None:
                 dog_dist = float(np.linalg.norm(wolf_pos - dog_pos))
                 
-                # Strong penalty for being too close to dog (danger zone)
-                if dog_dist < 100.0:  # Dog can kill wolf at this distance
-                    # Large penalty for being in kill range
-                    reward -= (1.0 - dog_dist / 100.0) * 0.5  # Increased from 0.25
-                elif dog_dist < 150.0:  # Moderate danger zone
-                    reward -= (1.0 - dog_dist / 150.0) * 0.2  # Increased from 0.1
-                elif dog_dist < 250.0:  # Caution zone
+                if dog_dist < 100.0:
+                    reward -= (1.0 - dog_dist / 100.0) * 0.5
+                elif dog_dist < 150.0:
+                    reward -= (1.0 - dog_dist / 150.0) * 0.2
+                elif dog_dist < 250.0:
                     reward -= (1.0 - dog_dist / 250.0) * 0.05
             
-            # Reward for strategic positioning: between dog and sheep
-            # This allows wolf to intercept sheep while avoiding dog
             if dog_pos is not None and pen_center is not None:
                 wolf_to_dog = float(np.linalg.norm(wolf_pos - dog_pos))
                 wolf_to_sheep_avg = avg_sheep_dist
                 
-                # Reward for being closer to sheep than dog is (intercept position)
                 dog_to_sheep_avg = float(np.mean(np.linalg.norm(sheep_positions - dog_pos, axis=1)))
                 if wolf_to_sheep_avg < dog_to_sheep_avg:
-                    reward += 0.15  # Bonus for better positioning
+                    reward += 0.15
     
-    # Small time penalty to encourage action
     reward -= 0.01
 
     return reward
@@ -729,34 +653,31 @@ def train(
     max_steps=2000,
     save_interval=50,
     device='cpu',
-    headless=False,               # show window by default
-    render_every_n_steps=20,      # render every 20 steps by default
-    render_fps=0,                 # Frame cap when rendering (<=60)
-    log_interval=1,               # Print progress every N episodes
+    headless=False,
+    render_every_n_steps=20,
+    render_fps=0,
+    log_interval=1,
 ):
     print("=" * 70)
-    print("STARTING MULTI-AGENT DQN TRAINING (OPTIMIZED FOR RTX 3060)")
+    print("FIXED MULTI-AGENT DQN TRAINING")
     print("=" * 70)
     print(f"Device: {device}")
     print(f"Episodes: {num_episodes}")
     print(f"Max steps per episode: {max_steps}")
+    print(f"Total training steps: {num_episodes * max_steps}")
     print(f"Number of discrete actions: {NUM_ACTIONS}")
-    print(f"Action space: {NUM_FORWARD_SPEEDS} forward speeds × {NUM_TURN_RATES} turn rates")
     print()
-    print("OPTIMIZATIONS ENABLED:")
-    print(f"  - Batch size: {BATCH_SIZE} (balanced for stable training)")
-    print(f"  - Updates per step: {MAX_UPDATES_PER_STEP} - Single update per trigger")
-    print(f"  - Replay buffer: {REPLAY_CAPACITY:,} capacity")
-    print(f"  - Update frequency: Every {UPDATE_EVERY} step(s)")
-    print(f"  - Mixed precision: Enabled (AMP)")
-    print(f"  - cuDNN benchmark: Enabled")
-    print(f"  - torch.compile: Disabled (requires Triton - can enable if available)")
+    print("KEY IMPROVEMENTS:")
+    print(f"  ✓ Per-step epsilon decay (linear annealing over {EPSILON_DECAY_STEPS:,} steps)")
+    print(f"  ✓ Soft target updates (TAU={TAU}, polyak averaging)")
+    print(f"  ✓ Updates per step: {MAX_UPDATES_PER_STEP} (improved sample efficiency)")
+    print(f"  ✓ GroupNorm instead of BatchNorm (better RL stability)")
+    print(f"  ✓ Update frequency: Every {UPDATE_EVERY} step(s)")
+    print(f"  ✓ Batch size: {BATCH_SIZE}")
+    print(f"  ✓ Replay buffer: {REPLAY_CAPACITY:,} capacity")
     if not headless:
         status = "disabled" if render_every_n_steps == 0 else f"every {render_every_n_steps} steps"
-        print(f"Rendering: {status} (press H to toggle 0 ↔ 20)")
-        print(f"Controls: ESC to quit, H to toggle rendering")
-    else:
-        print("Headless mode: rendering disabled (no window will appear)")
+        print(f"Rendering: {status} (press H to toggle)")
     print()
 
     observation_shape = (config.OBSERVATION_CHANNELS, config.OBSERVATION_GRID_SIZE, config.OBSERVATION_GRID_SIZE)
@@ -773,19 +694,19 @@ def train(
         gamma=GAMMA,
         tau=TAU,
         lr=LR,
-        hidden_dim=512,  # Optimized for best performance (GPU can handle it)
+        hidden_dim=512,
         buffer_capacity=REPLAY_CAPACITY,
         batch_size=BATCH_SIZE,
         update_every=UPDATE_EVERY,
-        max_updates_per_step=MAX_UPDATES_PER_STEP,  # OPTIMIZED: Multiple updates per trigger
+        max_updates_per_step=MAX_UPDATES_PER_STEP,
         target_update_every=TARGET_UPDATE_EVERY,
         learning_starts=WARMUP_STEPS,
         epsilon_start=EPSILON_START,
         epsilon_end=EPSILON_END,
-        epsilon_decay=EPSILON_DECAY,
+        epsilon_decay_steps=EPSILON_DECAY_STEPS,
         pen_vec_dim=2,
         num_actions=NUM_ACTIONS,
-        use_torch_compile=False  # DISABLED: Requires Triton (can cause issues on some systems)
+        use_torch_compile=False
     )
 
     if TRAIN_DOG or LOAD_DOG_CHECKPOINT:
@@ -817,7 +738,6 @@ def train(
     for episode in range(num_episodes):
         (dog_obs, dog_pen_vec), (wolf_obs, wolf_pen_vec) = simulator.reset()
 
-        # ensure window appears immediately when not headless
         if not simulator.headless and render_every_n_steps > 0:
             simulator.render(fps=render_fps)
 
@@ -840,7 +760,6 @@ def train(
                             simulator.close()
                             return
                         elif event.key == pygame.K_h:
-                            # Toggle 0 ↔ 20
                             render_every_n_steps = 1 if render_every_n_steps == 0 else 0
                             status = "disabled" if render_every_n_steps == 0 else f"every {render_every_n_steps} steps"
                             print(f"\nRendering {status} (press H to toggle)")
@@ -898,12 +817,10 @@ def train(
                 f"Wolf R: {avg_wolf_reward:.2f} | "
                 f"Sheep Saved: {avg_sheep_saved:.1f} | "
                 f"Steps: {step + 1} | "
-                f"Dog Replay: {dog_agent.replay.size}/{dog_agent.replay.capacity} | " if TRAIN_DOG else ""
-                f"Wolf Replay: {wolf_agent.replay.size}/{wolf_agent.replay.capacity} | " if TRAIN_WOLF else ""
+                f"Dog ε: {dog_agent.epsilon:.3f} | " if TRAIN_DOG else ""
+                f"Wolf ε: {wolf_agent.epsilon:.3f} | " if TRAIN_WOLF else ""
                 f"Dog Updates: {dog_agent.update_count} | " if TRAIN_DOG else ""
                 f"Wolf Updates: {wolf_agent.update_count} | " if TRAIN_WOLF else ""
-                f"ε(dog): {dog_agent.epsilon:.3f} | " if TRAIN_DOG else ""
-                f"ε(wolf): {wolf_agent.epsilon:.3f} | " if TRAIN_WOLF else ""
                 f"Time: {elapsed:.1f}s"
             )
 
@@ -937,8 +854,8 @@ if __name__ == "__main__":
         max_steps=MAX_STEPS_PER_EPISODE,
         save_interval=SAVE_EVERY_EPISODES,
         device=device,
-        headless=HEADLESS,          # Uses config from top (True = faster)
-        render_every_n_steps=RENDER_EVERY,  # Uses config from top (0 = no render)
+        headless=HEADLESS,
+        render_every_n_steps=RENDER_EVERY,
         render_fps=60,
         log_interval=1,
     )
