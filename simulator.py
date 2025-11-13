@@ -613,8 +613,6 @@ class Simulator:
             'sheep_ids': state.sheep_ids,
             # Pen center for distance calculations
             'pen_center': pen_center,
-            # Pen entrance position (x, top_y, bottom_y, width) for directional rewards
-            'pen_entrance_position': state.pen_entrance_position,
             # IDs of sheep that were affected this step
             'sheep_entered_ids': sheep_entered_ids,
             'sheep_eaten_ids': sheep_eaten_ids,
