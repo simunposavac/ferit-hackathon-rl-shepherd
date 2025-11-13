@@ -141,7 +141,7 @@ def find_latest_checkpoint(save_dir: str, agent_type: str) -> str | None:
 # ============================================================================
 
 EPISODES = 1000 # how many episodes to run (Longer - more training, you can checkpoint and resume)
-MAX_STEPS_PER_EPISODE = 2000 # max steps per episode
+MAX_STEPS_PER_EPISODE = 3600 # max steps per episode
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 TRAIN_DOG = True
@@ -748,9 +748,9 @@ def dog_reward_fn(info: Dict[str, any], prev_info: Dict[str, any]=None) -> float
         # - Close to dog (within herding range)
         # - Moving toward pen (or at least not too far)
         # - In a reasonable herding position
-        herded_sheep_count = 0
-        herd_progress = 0.0
-        
+        #herded_sheep_count = 0
+        #herd_progress = 0.0
+        """
         if dog_velocity is not None and np.linalg.norm(dog_velocity) > 0.1:
             dog_velocity_normalized = dog_velocity / np.linalg.norm(dog_velocity)
             
@@ -792,7 +792,7 @@ def dog_reward_fn(info: Dict[str, any], prev_info: Dict[str, any]=None) -> float
             if herd_progress > 0:
                 herd_reward += (herd_progress / max(herded_sheep_count, 1)) * 0.2
             reward += herd_reward
-        
+        """
         # ========================================================================
         # EXISTING REWARDS (kept for stability)
         # ========================================================================
@@ -823,6 +823,7 @@ def dog_reward_fn(info: Dict[str, any], prev_info: Dict[str, any]=None) -> float
         # ========================================================================
         # NEGATIVE REWARDS: Penalize bad herding behavior
         # ========================================================================
+        """
         if dog_velocity is not None and np.linalg.norm(dog_velocity) > 0.1:
             dog_velocity_normalized = dog_velocity / np.linalg.norm(dog_velocity)
             dog_to_pen = pen_center - dog_pos
@@ -951,7 +952,7 @@ def dog_reward_fn(info: Dict[str, any], prev_info: Dict[str, any]=None) -> float
                 if looks_opposite_pen and not sees_sheep_group and not (had_recent_interaction or current_interaction):
                     # Maximum penalty: reduce all positive rewards
                     reward = min(reward, -5.0)  # Cap at -5.0 or keep existing negative rewards
-    
+    """
     # Small penalty for time (encourages faster completion)
     reward -= 0.01
 
@@ -1074,7 +1075,7 @@ def wolf_reward_fn(info, prev_info=None) -> float:
 # ============================================================================
 def train(
     num_episodes=1000,
-    max_steps=2000,
+    max_steps=3600,
     save_interval=50,
     device='cpu',
     headless=False,               # show window by default
@@ -1310,7 +1311,7 @@ if __name__ == "__main__":
 
     train(
         num_episodes=1000,
-        max_steps=2000,
+        max_steps=3600,
         save_interval=SAVE_EVERY_EPISODES,
         device=device,
         headless=False,             # keep window visible by default

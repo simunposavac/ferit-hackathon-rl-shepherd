@@ -679,7 +679,7 @@ def wolf_reward_fn(info, prev_info=None) -> float:
 # ============================================================================
 def train(
     num_episodes=1000,
-    max_steps=2000,
+    max_steps=3600,
     save_interval=50,
     device='cpu',
     headless=False,               # show window by default

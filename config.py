@@ -45,7 +45,7 @@ GAUSSIAN_RADIUS = 2  # Truncation radius in grid cells (how far to splat)
 # ============================================================================
 
 # Screen dimensions
-SCREEN_WIDTH = 800
+SCREEN_WIDTH = 1000
 SCREEN_HEIGHT = 800
 
 PADDING = 15
@@ -112,7 +112,7 @@ BOIDS_W_WOLF_THREAT = 2.0
 BOIDS_W_DOG_THREAT = 3.0
 BOIDS_COMPRESSION_FACTOR = 5.0
 
-# Boids radius parameters
+# Boids radius parameters[]
 SHEEP_SEPARATION_RADIUS = 30
 SHEEP_ALIGNMENT_RADIUS = 250
 SHEEP_COHESION_RADIUS = 200
@@ -154,7 +154,7 @@ WOLF_EAT_COOLDOWN_STEPS = 180  # Cooldown after eating sheep (steps, ~3 seconds 
 
 # Dog killing wolf parameters
 DOG_KILL_WOLF_DISTANCE = 40  # Distance at which dog can kill wolf (pixels)
-WOLF_RESPAWN_COOLDOWN_STEPS = 120  # Cooldown before wolf respawns after being killed (steps, ~2 seconds at 60 FPS)
+WOLF_RESPAWN_COOLDOWN_STEPS = 150  # Cooldown before wolf respawns after being killed (steps, ~2 seconds at 60 FPS)
 
 # ============================================================================
 # RENDERING PARAMETERS

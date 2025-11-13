@@ -466,7 +466,7 @@ def wolf_reward_fn(info: Dict[str, Any], prev_info: Optional[Dict[str, Any]] = N
 # ============================================================================
 
 def train(num_episodes=1000,      # how many episodes to run (Longer - more training, you can checkpoint and resume)
-          max_steps=2000,         # max steps per episode
+          max_steps=3600,         # max steps per episode
           device='cuda' if torch.cuda.is_available() else 'cpu',
           headless=False,         # hides the window for faster training
           render_every=1,         # draw environment image every N steps
@@ -651,7 +651,7 @@ def get_checkpoint_dir():
 if __name__ == "__main__":
     train(
         num_episodes=1000,
-        max_steps=2000,
+        max_steps=3600,
         headless=False,          
         render_every=1,  
         render_fps=60,

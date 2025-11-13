@@ -90,7 +90,7 @@ def find_latest_checkpoint(save_dir: str, agent_type: str) -> str | None:
 # ============================================================================
 
 EPISODES = 1000
-MAX_STEPS_PER_EPISODE = 2000
+MAX_STEPS_PER_EPISODE = 3600
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 TRAIN_DOG = True
@@ -691,7 +691,7 @@ def wolf_reward_fn(info, prev_info=None) -> float:
 # ============================================================================
 def train(
     num_episodes=1000,
-    max_steps=2000,
+    max_steps=3600,
     save_interval=50,
     device='cpu',
     headless=False,
