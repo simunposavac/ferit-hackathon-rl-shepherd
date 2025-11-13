@@ -715,6 +715,71 @@ def dog_reward_fn(info: Dict[str, any], prev_info: Dict[str, any]=None) -> float
             # Reward if dog is between wolf and sheep
             if wolf_to_dog < wolf_to_sheep:
                 reward += 0.1
+        
+        # ========================================================================
+        # NEGATIVE REWARDS: Penalize bad herding behavior
+        # ========================================================================
+        if dog_velocity is not None and np.linalg.norm(dog_velocity) > 0.1:
+            dog_velocity_normalized = dog_velocity / np.linalg.norm(dog_velocity)
+            dog_to_pen = pen_center - dog_pos
+            dog_to_pen_norm = np.linalg.norm(dog_to_pen)
+            
+            if dog_to_pen_norm > 1.0:
+                dog_to_pen_normalized = dog_to_pen / dog_to_pen_norm
+                alignment_to_pen = np.dot(dog_velocity_normalized, dog_to_pen_normalized)
+                
+                # 1. NEGATIVE: Dog moving toward pen but sheep group is behind (opposite side)
+                if alignment_to_pen > 0.5:  # Dog is moving toward pen
+                    sheep_behind_count = 0
+                    
+                    # Count sheep behind the dog (opposite direction from pen)
+                    for sheep_pos in sheep_positions:
+                        dog_to_sheep = sheep_pos - dog_pos
+                        dist_to_sheep = np.linalg.norm(dog_to_sheep)
+                        
+                        if dist_to_sheep > 1.0:
+                            dog_to_sheep_normalized = dog_to_sheep / dist_to_sheep
+                            # Dot product: negative = sheep is behind dog
+                            behind_score = np.dot(dog_velocity_normalized, dog_to_sheep_normalized)
+                            
+                            # Check if sheep is behind (opposite to pen direction)
+                            # and also check if sheep is on opposite side of pen direction
+                            sheep_to_pen_alignment = np.dot(dog_to_sheep_normalized, -dog_to_pen_normalized)
+                            
+                            # Sheep is behind and on opposite side if:
+                            # - behind_score < -0.3 (behind dog's movement)
+                            # - sheep_to_pen_alignment > 0.3 (sheep is in direction opposite to pen from dog)
+                            if behind_score < -0.3 and sheep_to_pen_alignment > 0.3 and dist_to_sheep < 400.0:
+                                sheep_behind_count += 1
+                    
+                    # If there's a significant group of sheep behind (opposite side), penalize
+                    if sheep_behind_count >= 2:  # At least 2 sheep form a group
+                        group_ratio = sheep_behind_count / len(sheep_positions)
+                        # Penalty increases with group size
+                        reward -= group_ratio * 0.3
+                
+                # 2. NEGATIVE: Dog moving toward pen but sees no sheep at all
+                if alignment_to_pen > 0.5:  # Dog is moving toward pen
+                    visible_sheep_count = 0
+                    max_vision_range = 350.0  # Maximum distance to "see" sheep
+                    
+                    for sheep_pos in sheep_positions:
+                        dog_to_sheep = sheep_pos - dog_pos
+                        dist_to_sheep = np.linalg.norm(dog_to_sheep)
+                        
+                        if dist_to_sheep < max_vision_range:
+                            # Check if sheep is in front or to the side (visible)
+                            if dist_to_sheep > 1.0:
+                                dog_to_sheep_normalized = dog_to_sheep / dist_to_sheep
+                                front_score = np.dot(dog_velocity_normalized, dog_to_sheep_normalized)
+                                
+                                # Sheep is visible if it's not directly behind (within 180 degree arc)
+                                if front_score > -0.7:  # Not completely behind
+                                    visible_sheep_count += 1
+                    
+                    # If no sheep are visible while moving toward pen, penalize
+                    if visible_sheep_count == 0:
+                        reward -= 0.4  # Significant penalty for abandoning sheep
     
     # Small penalty for time (encourages faster completion)
     reward -= 0.01
