@@ -681,10 +681,33 @@ def dog_reward_fn(info: Dict[str, any], prev_info: Dict[str, any]=None) -> float
     sheep_eaten = info.get("sheep_eaten", 0)
     wolf_killed = info.get("wolf_killed", False)
     
-    # Big rewards/penalties for main events
-    reward += float(sheep_entered) * 110.0  # Major reward for saving sheep
-    reward -= float(sheep_eaten) * 120.0     # Major penalty when wolf eats sheep
-    reward += float(wolf_killed) * 70.0      # Bonus for killing wolf
+    # ========================================================================
+    # SESSION-SPECIFIC REWARDS: Dog guiding sheep to pen
+    # ========================================================================
+    
+    # Sheep entered pen reward - only full reward if dog sees it
+    if sheep_entered > 0:
+        # Check if dog can see the pen (within FOV/distance)
+        dog_pos = info.get("dog_position", None)
+        pen_center = info.get("pen_center", None)
+        dog_can_see_pen = False
+        
+        if dog_pos is not None and pen_center is not None:
+            dog_to_pen = pen_center - dog_pos
+            dist_to_pen = np.linalg.norm(dog_to_pen)
+            # Assume FOV range is similar to sheep visibility (350 pixels)
+            max_vision_range = 350.0
+            if dist_to_pen < max_vision_range:
+                dog_can_see_pen = True
+        
+        if dog_can_see_pen:
+            reward += float(sheep_entered) * 110.0  # Full reward for saving sheep
+        else:
+            reward += float(sheep_entered) * 110.0 * 0.15  # Only 15% reward if not seen
+    
+    # Other events (commented out for this session)
+    # reward -= float(sheep_eaten) * 120.0     # Major penalty when wolf eats sheep
+    # reward += float(wolf_killed) * 70.0      # Bonus for killing wolf
     
     # Dense shaping rewards (help learning when sparse rewards are rare)
     sheep_positions = info.get("sheep_positions", None)
@@ -695,8 +718,10 @@ def dog_reward_fn(info: Dict[str, any], prev_info: Dict[str, any]=None) -> float
     
     if sheep_positions is not None and len(sheep_positions) > 0 and dog_pos is not None and pen_center is not None:
         # ========================================================================
-        # 1. ALIGNMENT REWARD: Dog's direction aligned with pen direction
+        # OLD REWARD LOGIC (COMMENTED OUT FOR THIS SESSION)
         # ========================================================================
+        """
+        # 1. ALIGNMENT REWARD: Dog's direction aligned with pen direction
         if dog_velocity is not None and np.linalg.norm(dog_velocity) > 0.1:
             # Vector from dog to pen
             dog_to_pen = pen_center - dog_pos
@@ -712,9 +737,7 @@ def dog_reward_fn(info: Dict[str, any], prev_info: Dict[str, any]=None) -> float
                 alignment_reward = max(0.0, alignment)  # Only reward positive alignment
                 reward += alignment_reward * 0.25  # Scale factor for alignment reward
         
-        # ========================================================================
         # 2. SHEEP IN FRONT OF DOG REWARD
-        # ========================================================================
         if dog_velocity is not None and np.linalg.norm(dog_velocity) > 0.1:
             dog_velocity_normalized = dog_velocity / np.linalg.norm(dog_velocity)
             sheep_in_front_count = 0
@@ -737,6 +760,70 @@ def dog_reward_fn(info: Dict[str, any], prev_info: Dict[str, any]=None) -> float
             # Reward for having sheep in front (herding position)
             if sheep_in_front_count > 0:
                 reward += min(sheep_in_front_count / len(sheep_positions), 1.0) * 0.2
+        """
+        
+        # ========================================================================
+        # NEW ANGLE-BASED REWARD: Perpendicular but slightly leading toward pen
+        # ========================================================================
+        if dog_velocity is not None and np.linalg.norm(dog_velocity) > 0.1:
+            # Vector from dog to pen (this is our reference direction, 0°)
+            dog_to_pen = pen_center - dog_pos
+            dog_to_pen_norm = np.linalg.norm(dog_to_pen)
+            
+            if dog_to_pen_norm > 1.0:
+                dog_to_pen_normalized = dog_to_pen / dog_to_pen_norm
+                dog_velocity_normalized = dog_velocity / np.linalg.norm(dog_velocity)
+                
+                # Calculate angle between dog velocity and pen direction
+                # Use atan2 to get angle in range [-180, 180] degrees
+                # First, we need to get the angle of pen direction and dog velocity
+                pen_angle = np.arctan2(dog_to_pen_normalized[1], dog_to_pen_normalized[0])  # Angle of pen direction
+                dog_angle = np.arctan2(dog_velocity_normalized[1], dog_velocity_normalized[0])  # Angle of dog velocity
+                
+                # Relative angle: difference between dog direction and pen direction
+                relative_angle = dog_angle - pen_angle
+                # Normalize to [-pi, pi] range
+                relative_angle = np.arctan2(np.sin(relative_angle), np.cos(relative_angle))
+                
+                # Convert to degrees
+                angle_deg = np.degrees(relative_angle)
+                
+                # Normalize to [0, 360) range for easier checking
+                if angle_deg < 0:
+                    angle_deg += 360
+                
+                # Check if angle is in desired range: 0°-85° or 275°-360° (which is -85°-0°)
+                # These ranges represent perpendicular but slightly leading toward pen
+                in_desired_range = (0 <= angle_deg <= 85) or (275 <= angle_deg < 360)
+                
+                if in_desired_range:
+                    # Calculate reward based on how close to optimal (45° or 315° would be ideal perpendicular)
+                    # Optimal angles are around 45° and 315° (perpendicular)
+                    if angle_deg <= 85:
+                        # Closer to 45° is better
+                        optimal_angle = 45.0
+                        angle_diff = abs(angle_deg - optimal_angle)
+                    else:  # 275 <= angle_deg < 360
+                        # Closer to 315° is better
+                        optimal_angle = 315.0
+                        angle_diff = abs(angle_deg - optimal_angle)
+                    
+                    # Reward decreases as we move away from optimal perpendicular angle
+                    # Maximum reward at optimal angle, decreases linearly
+                    angle_reward = max(0.0, 1.0 - angle_diff / 45.0)  # Normalized reward
+                    reward += angle_reward * 0.3  # Scale factor
+                
+                # Check if pushing sheep further from pen (negative reward)
+                if prev_info is not None:
+                    prev_sheep_pos = prev_info.get("sheep_positions", None)
+                    if prev_sheep_pos is not None and len(prev_sheep_pos) == len(sheep_positions):
+                        prev_dists_to_pen = np.linalg.norm(prev_sheep_pos - pen_center, axis=1)
+                        curr_dists_to_pen = np.linalg.norm(sheep_positions - pen_center, axis=1)
+                        avg_progress = float(np.mean(curr_dists_to_pen - prev_dists_to_pen))  # Positive = moving away
+                        
+                        if avg_progress > 0:  # Sheep moving away from pen
+                            # Negative reward for pushing sheep away
+                            reward -= min(avg_progress / 10.0, 0.5)  # Cap penalty at 0.5
         
         # ========================================================================
         # 3. HERD SIZE REWARD: Larger reward when pushing more sheep toward pen
@@ -794,8 +881,9 @@ def dog_reward_fn(info: Dict[str, any], prev_info: Dict[str, any]=None) -> float
             reward += herd_reward
         """
         # ========================================================================
-        # EXISTING REWARDS (kept for stability)
+        # OLD REWARDS (COMMENTED OUT FOR THIS SESSION)
         # ========================================================================
+        """
         avg_sheep_dist = float(np.mean(sheep_dists))
         min_sheep_dist = float(np.min(sheep_dists))
         
@@ -819,6 +907,7 @@ def dog_reward_fn(info: Dict[str, any], prev_info: Dict[str, any]=None) -> float
             # Reward if dog is between wolf and sheep
             if wolf_to_dog < wolf_to_sheep:
                 reward += 0.1
+        """
         
         # ========================================================================
         # NEGATIVE REWARDS: Penalize bad herding behavior
@@ -967,10 +1056,17 @@ def wolf_reward_fn(info, prev_info=None) -> float:
     wolf_is_dead = info.get("wolf_is_dead", False)
     sheep_entered_pen = info.get("sheep_entered_pen", 0)
     
-    # Big rewards/penalties for main events
-    reward += float(sheep_eaten) * 150.0      # Major reward for eating sheep
-    reward -= float(wolf_killed) * 100.0      # Major penalty for dying
-    reward -= float(sheep_entered_pen) * 50.0 # Penalty when dog succeeds
+    # ========================================================================
+    # SESSION-SPECIFIC REWARDS: Wolf pushing sheep away from pen (opposite of dog)
+    # ========================================================================
+    
+    # Wolf gets negative reward when sheep enter pen (larger penalty)
+    if sheep_entered_pen > 0:
+        reward -= float(sheep_entered_pen) * 100.0  # Larger penalty for helping sheep reach pen
+    
+    # Other events (commented out for this session)
+    # reward += float(sheep_eaten) * 150.0      # Major reward for eating sheep
+    # reward -= float(wolf_killed) * 100.0      # Major penalty for dying
     
     # Dense shaping rewards (only when wolf is alive)
     if not wolf_is_dead:
@@ -981,6 +1077,10 @@ def wolf_reward_fn(info, prev_info=None) -> float:
         pen_center = info.get("pen_center", None)
         
         if sheep_positions is not None and len(sheep_positions) > 0 and wolf_pos is not None:
+            # ========================================================================
+            # OLD WOLF REWARD LOGIC (COMMENTED OUT FOR THIS SESSION)
+            # ========================================================================
+            """
             # Strong shaping: reward for getting close to nearest sheep
             sheep_dists = np.linalg.norm(sheep_positions - wolf_pos, axis=1)
             min_dist = float(np.min(sheep_dists))
@@ -1009,9 +1109,7 @@ def wolf_reward_fn(info, prev_info=None) -> float:
                 elif dog_dist < 150.0:  # Moderate danger zone
                     reward -= (1.0 - dog_dist / 150.0) * 0.1
             
-            # ========================================================================
             # WOLF PENALTY: Negative reward if wolf guides sheep to pen
-            # ========================================================================
             if wolf_velocity is not None and np.linalg.norm(wolf_velocity) > 0.1 and pen_center is not None:
                 wolf_velocity_normalized = wolf_velocity / np.linalg.norm(wolf_velocity)
                 wolf_to_pen = pen_center - wolf_pos
@@ -1026,9 +1124,7 @@ def wolf_reward_fn(info, prev_info=None) -> float:
                     if alignment_to_pen > 0.7:  # Strongly aligned with pen direction
                         reward -= 0.5  # Penalty for helping sheep reach pen
             
-            # ========================================================================
             # WOLF POSITIVE REWARD: Wolf's vector to pen is opposite and sheep group on opposite side
-            # ========================================================================
             if wolf_velocity is not None and np.linalg.norm(wolf_velocity) > 0.1 and pen_center is not None:
                 wolf_velocity_normalized = wolf_velocity / np.linalg.norm(wolf_velocity)
                 wolf_to_pen = pen_center - wolf_pos
@@ -1064,6 +1160,63 @@ def wolf_reward_fn(info, prev_info=None) -> float:
                             group_ratio = sheep_behind_count / len(sheep_positions)
                             # Reward for having sheep group on opposite side while moving away from pen
                             reward += group_ratio * 0.4
+            """
+            
+            # ========================================================================
+            # NEW WOLF ANGLE-BASED REWARD: Opposite of dog - push sheep away from pen
+            # ========================================================================
+            if wolf_velocity is not None and np.linalg.norm(wolf_velocity) > 0.1 and pen_center is not None:
+                # Vector from wolf to pen (reference direction)
+                wolf_to_pen = pen_center - wolf_pos
+                wolf_to_pen_norm = np.linalg.norm(wolf_to_pen)
+                
+                if wolf_to_pen_norm > 1.0:
+                    wolf_to_pen_normalized = wolf_to_pen / wolf_to_pen_norm
+                    wolf_velocity_normalized = wolf_velocity / np.linalg.norm(wolf_velocity)
+                    
+                    # Calculate angle between wolf velocity and pen direction (same as dog logic)
+                    pen_angle = np.arctan2(wolf_to_pen_normalized[1], wolf_to_pen_normalized[0])
+                    wolf_angle = np.arctan2(wolf_velocity_normalized[1], wolf_velocity_normalized[0])
+                    
+                    relative_angle = wolf_angle - pen_angle
+                    relative_angle = np.arctan2(np.sin(relative_angle), np.cos(relative_angle))
+                    angle_deg = np.degrees(relative_angle)
+                    
+                    if angle_deg < 0:
+                        angle_deg += 360
+                    
+                    # Wolf gets NEGATIVE reward when in same range as dog (pushing toward pen)
+                    # Range 0°-85° or 275°-360° means pushing toward pen (bad for wolf)
+                    in_toward_pen_range = (0 <= angle_deg <= 85) or (275 <= angle_deg < 360)
+                    
+                    if in_toward_pen_range:
+                        # Calculate penalty based on how close to optimal perpendicular (larger penalty)
+                        if angle_deg <= 85:
+                            optimal_angle = 45.0
+                            angle_diff = abs(angle_deg - optimal_angle)
+                        else:  # 275 <= angle_deg < 360
+                            optimal_angle = 315.0
+                            angle_diff = abs(angle_deg - optimal_angle)
+                        
+                        # Larger negative reward for pushing toward pen
+                        angle_penalty = max(0.0, 1.0 - angle_diff / 45.0)
+                        reward -= angle_penalty * 0.5  # Larger penalty than dog's positive reward
+                    
+                    # Wolf gets POSITIVE reward when pushing sheep away from pen
+                    # Check if sheep are moving away from pen
+                    if prev_info is not None:
+                        prev_sheep_pos = prev_info.get("sheep_positions", None)
+                        if prev_sheep_pos is not None and len(prev_sheep_pos) == len(sheep_positions):
+                            prev_dists_to_pen = np.linalg.norm(prev_sheep_pos - pen_center, axis=1)
+                            curr_dists_to_pen = np.linalg.norm(sheep_positions - pen_center, axis=1)
+                            avg_progress = float(np.mean(curr_dists_to_pen - prev_dists_to_pen))  # Positive = moving away
+                            
+                            if avg_progress > 0:  # Sheep moving away from pen (good for wolf)
+                                # Positive reward for pushing sheep away
+                                reward += min(avg_progress / 10.0, 0.5)  # Cap reward at 0.5
+                            elif avg_progress < 0:  # Sheep moving toward pen (bad for wolf)
+                                # Additional negative reward for pushing toward pen
+                                reward -= min(abs(avg_progress) / 10.0, 0.5)  # Cap penalty at 0.5
     
     # Small time penalty to encourage action
     reward -= 0.01
