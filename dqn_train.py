@@ -47,21 +47,22 @@ WOLF_CHECKPOINT_PATH = r"saves/dqn/best_wolf.pth"
 # ============================================================================
 
 EPISODES = 1000  # how many episodes to run (Longer - more training, you can checkpoint and resume)
-MAX_STEPS_PER_EPISODE = 1500  # max steps per episode (reduced for speed)
+MAX_STEPS_PER_EPISODE = 2000  # max steps per episode
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 TRAIN_DOG = True
 TRAIN_WOLF = True
 
-# DQN hyperparameters
+# DQN hyperparameters - OPTIMIZED FOR RTX 3060 (12GB VRAM)
 LR = 3e-4           # Learning rate for Q-network
 GAMMA = 0.99        # Discount factor (importance of future rewards)
-TAU = 0.005         # Target network soft-update rate
-BATCH_SIZE = 96     # [64 - 256] Balanced for speed and stability
-REPLAY_CAPACITY = 250_000  # [100k - 500k] Max transitions stored in replay buffer
-WARMUP_STEPS = 3_000  # Number of env steps collected before any learning
-UPDATE_EVERY = 2    # Do 1 update every N environment steps
-TARGET_UPDATE_EVERY = 100  # Update target network every N updates (hard update)
+TAU = 0.005         # Target network soft-update rate (unused for hard updates)
+BATCH_SIZE = 512    # OPTIMIZED: Large batch size to utilize RTX 3060 fully (was 96)
+REPLAY_CAPACITY = 500_000  # OPTIMIZED: Larger buffer for more diverse samples (was 250k)
+WARMUP_STEPS = 5_000  # OPTIMIZED: More warmup for better initial samples (was 3k)
+UPDATE_EVERY = 1    # OPTIMIZED: Update every step (was 2) - we do multiple updates per trigger
+MAX_UPDATES_PER_STEP = 4  # OPTIMIZED: Do 4 updates when triggered (utilizes GPU fully)
+TARGET_UPDATE_EVERY = 200  # OPTIMIZED: Update target network every N updates (hard update, was 100)
 EPSILON_START = 1.0  # Initial exploration rate
 EPSILON_END = 0.01   # Final exploration rate
 EPSILON_DECAY = 0.995  # Epsilon decay per episode
@@ -206,14 +207,15 @@ class ReplayBuffer:
         self.size = min(self.size + 1, self.capacity)
 
     def sample(self, batch_size: int):
+        # OPTIMIZED: Use torch.from_numpy for faster conversion (shares memory, non-blocking transfer)
         idxs = np.random.randint(0, self.size, size=batch_size)
-        obs = torch.as_tensor(self.obs_buf[idxs], device=self.device)
-        pen = torch.as_tensor(self.pen_buf[idxs], device=self.device)
-        act = torch.as_tensor(self.act_buf[idxs], device=self.device)
-        rew = torch.as_tensor(self.rew_buf[idxs], device=self.device)
-        next_obs = torch.as_tensor(self.next_obs_buf[idxs], device=self.device)
-        next_pen = torch.as_tensor(self.next_pen_buf[idxs], device=self.device)
-        done = torch.as_tensor(self.done_buf[idxs], device=self.device)
+        obs = torch.from_numpy(self.obs_buf[idxs]).to(self.device, non_blocking=True)
+        pen = torch.from_numpy(self.pen_buf[idxs]).to(self.device, non_blocking=True)
+        act = torch.from_numpy(self.act_buf[idxs]).to(self.device, non_blocking=True)
+        rew = torch.from_numpy(self.rew_buf[idxs]).to(self.device, non_blocking=True)
+        next_obs = torch.from_numpy(self.next_obs_buf[idxs]).to(self.device, non_blocking=True)
+        next_pen = torch.from_numpy(self.next_pen_buf[idxs]).to(self.device, non_blocking=True)
+        done = torch.from_numpy(self.done_buf[idxs]).to(self.device, non_blocking=True)
         return obs, pen, act, rew, next_obs, next_pen, done
 
 
@@ -225,6 +227,7 @@ class DQNAgent(BaseAgent):
     """
     Deep Q-Network agent implementing BaseAgent interface.
     Uses epsilon-greedy exploration and target network.
+    OPTIMIZED FOR RTX 3060: Large batches, multiple updates per step, torch.compile
     """
     def __init__(
         self,
@@ -235,23 +238,26 @@ class DQNAgent(BaseAgent):
         gamma=0.99,
         tau=0.005,
         lr=3e-4,
-        hidden_dim=384,
-        buffer_capacity=200_000,
-        batch_size=128,
-        update_every=8,
-        target_update_every=100,
-        learning_starts=10_000,
+        hidden_dim=512,
+        buffer_capacity=500_000,
+        batch_size=512,
+        update_every=1,
+        max_updates_per_step=4,
+        target_update_every=200,
+        learning_starts=5_000,
         epsilon_start=1.0,
         epsilon_end=0.01,
         epsilon_decay=0.995,
         pen_vec_dim=2,
-        num_actions=NUM_ACTIONS
+        num_actions=NUM_ACTIONS,
+        use_torch_compile=True
     ):
         self.device = device
         self.gamma = gamma
         self.tau = tau
         self.batch_size = batch_size
         self.update_every = update_every
+        self.max_updates_per_step = max_updates_per_step
         self.target_update_every = target_update_every
         self.learning_starts = learning_starts
         self.agent_type = agent_type
@@ -265,7 +271,8 @@ class DQNAgent(BaseAgent):
 
         self.use_amp = (device == 'cuda')
         if self.use_amp:
-            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.benchmark = True  # Faster convs for fixed input sizes
+            torch.backends.cudnn.deterministic = False
             self.scaler = torch.amp.GradScaler('cuda')
         else:
             self.scaler = None
@@ -274,8 +281,20 @@ class DQNAgent(BaseAgent):
         self.q_network = DQN(observation_shape, pen_vec_dim, hidden_dim, num_actions).to(device)
         self.target_network = DQN(observation_shape, pen_vec_dim, hidden_dim, num_actions).to(device)
         self.target_network.load_state_dict(self.q_network.state_dict())
+        
+        # OPTIMIZATION: Compile network for faster execution (PyTorch 2.0+)
+        if use_torch_compile and device == 'cuda' and hasattr(torch, 'compile'):
+            try:
+                print(f"Compiling {agent_type} Q-network with torch.compile for faster execution...")
+                self.q_network = torch.compile(self.q_network, mode='reduce-overhead')
+                print(f"Successfully compiled {agent_type} Q-network!")
+            except Exception as e:
+                print(f"Warning: torch.compile failed for {agent_type}: {e}. Continuing without compilation.")
+        
+        # Set target network to eval mode (no gradients needed)
+        self.target_network.eval()
 
-        self.optimizer = torch.optim.Adam(self.q_network.parameters(), lr=lr)
+        self.optimizer = torch.optim.Adam(self.q_network.parameters(), lr=lr, eps=1e-7)
 
         self.replay = ReplayBuffer(buffer_capacity, observation_shape, pen_vec_dim, action_dim=1, device=device)
         self.total_steps = 0
@@ -288,8 +307,9 @@ class DQNAgent(BaseAgent):
         return obs_grid, pen_vec
 
     def act(self, observation: np.ndarray, pen_vector: np.ndarray):
+        # OPTIMIZED: Use inference mode for faster execution (no gradient tracking)
         self.q_network.eval()
-        with torch.no_grad():
+        with torch.inference_mode():  # OPTIMIZED: inference_mode is faster than no_grad
             obs_grid, pen_vec = self._to_tensor_inputs(observation, pen_vector)
             q_values = self.q_network(obs_grid, pen_vec)
             # Epsilon-greedy exploration
@@ -329,42 +349,50 @@ class DQNAgent(BaseAgent):
 
         self.total_steps += 1
 
-        # Begin learning after warmup
+        # OPTIMIZED: Begin learning after warmup, do multiple updates per trigger
         if self.replay.size >= self.learning_starts and (self.total_steps % self.update_every == 0):
-            self._update()
+            # Do multiple updates to utilize GPU fully
+            for _ in range(self.max_updates_per_step):
+                self._update()
 
     def _update(self):
+        # OPTIMIZED: Sample batch (already on GPU from ReplayBuffer)
         obs, pen, act, rew, next_obs, next_pen, done = self.replay.sample(self.batch_size)
 
-        # Compute target Q-values using target network
+        # Compute target Q-values using target network (no gradients)
         with torch.amp.autocast('cuda', enabled=self.use_amp), torch.no_grad():
             next_q_values = self.target_network(next_obs, next_pen)
             next_q_max = next_q_values.max(dim=1, keepdim=True)[0]
             target_q = rew + (1.0 - done) * self.gamma * next_q_max
 
-        # Compute current Q-values
-        self.optimizer.zero_grad(set_to_none=True)
+        # Compute current Q-values and loss
+        self.optimizer.zero_grad(set_to_none=True)  # OPTIMIZED: set_to_none for faster
+        
         with torch.amp.autocast('cuda', enabled=self.use_amp):
             q_values = self.q_network(obs, pen)
             q_selected = q_values.gather(1, act.long())
             loss = F.mse_loss(q_selected, target_q)
 
+        # Backward pass and optimization
         if self.scaler is not None:
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.q_network.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(self.q_network.parameters(), 10.0)  # Increased clip for large batches
             self.scaler.step(self.optimizer)
             self.scaler.update()
         else:
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.q_network.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(self.q_network.parameters(), 10.0)
             self.optimizer.step()
 
         self.update_count += 1
 
         # Update target network (hard update every N steps)
         if self.update_count % self.target_update_every == 0:
-            self.target_network.load_state_dict(self.q_network.state_dict())
+            # OPTIMIZED: Only update target network periodically (saves computation)
+            with torch.no_grad():
+                for target_param, param in zip(self.target_network.parameters(), self.q_network.parameters()):
+                    target_param.data.copy_(param.data)
 
     def episode_start(self):
         pass
@@ -386,6 +414,7 @@ class DQNAgent(BaseAgent):
                 "tau": self.tau,
                 "batch_size": self.batch_size,
                 "update_every": self.update_every,
+                "max_updates_per_step": self.max_updates_per_step,
                 "target_update_every": self.target_update_every,
                 "learning_starts": self.learning_starts,
                 "epsilon": self.epsilon,
@@ -686,13 +715,23 @@ def train(
     log_interval=1,               # Print progress every N episodes
 ):
     print("=" * 70)
-    print("STARTING MULTI-AGENT DQN TRAINING")
+    print("STARTING MULTI-AGENT DQN TRAINING (OPTIMIZED FOR RTX 3060)")
     print("=" * 70)
     print(f"Device: {device}")
     print(f"Episodes: {num_episodes}")
     print(f"Max steps per episode: {max_steps}")
     print(f"Number of discrete actions: {NUM_ACTIONS}")
     print(f"Action space: {NUM_FORWARD_SPEEDS} forward speeds × {NUM_TURN_RATES} turn rates")
+    print()
+    print("OPTIMIZATIONS ENABLED:")
+    print(f"  - Batch size: {BATCH_SIZE} (was 96) - Utilizes GPU fully")
+    print(f"  - Updates per step: {MAX_UPDATES_PER_STEP} - Multiple updates per trigger")
+    print(f"  - Replay buffer: {REPLAY_CAPACITY:,} capacity - More diverse samples")
+    print(f"  - Update frequency: Every {UPDATE_EVERY} step(s)")
+    print(f"  - Mixed precision: Enabled (AMP)")
+    if device == 'cuda' and hasattr(torch, 'compile'):
+        print(f"  - torch.compile: Enabled (PyTorch 2.0+)")
+    print(f"  - cuDNN benchmark: Enabled")
     if not headless:
         status = "disabled" if render_every_n_steps == 0 else f"every {render_every_n_steps} steps"
         print(f"Rendering: {status} (press H to toggle 0 ↔ 20)")
@@ -719,13 +758,15 @@ def train(
         buffer_capacity=REPLAY_CAPACITY,
         batch_size=BATCH_SIZE,
         update_every=UPDATE_EVERY,
+        max_updates_per_step=MAX_UPDATES_PER_STEP,  # OPTIMIZED: Multiple updates per trigger
         target_update_every=TARGET_UPDATE_EVERY,
         learning_starts=WARMUP_STEPS,
         epsilon_start=EPSILON_START,
         epsilon_end=EPSILON_END,
         epsilon_decay=EPSILON_DECAY,
         pen_vec_dim=2,
-        num_actions=NUM_ACTIONS
+        num_actions=NUM_ACTIONS,
+        use_torch_compile=True  # OPTIMIZED: Enable torch.compile for faster execution
     )
 
     if TRAIN_DOG or LOAD_DOG_CHECKPOINT:
@@ -840,6 +881,8 @@ def train(
                 f"Steps: {step + 1} | "
                 f"Dog Replay: {dog_agent.replay.size}/{dog_agent.replay.capacity} | " if TRAIN_DOG else ""
                 f"Wolf Replay: {wolf_agent.replay.size}/{wolf_agent.replay.capacity} | " if TRAIN_WOLF else ""
+                f"Dog Updates: {dog_agent.update_count} | " if TRAIN_DOG else ""
+                f"Wolf Updates: {wolf_agent.update_count} | " if TRAIN_WOLF else ""
                 f"ε(dog): {dog_agent.epsilon:.3f} | " if TRAIN_DOG else ""
                 f"ε(wolf): {wolf_agent.epsilon:.3f} | " if TRAIN_WOLF else ""
                 f"Time: {elapsed:.1f}s"
