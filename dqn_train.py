@@ -556,9 +556,9 @@ def dog_reward_fn(info: Dict[str, any], prev_info: Dict[str, any] = None) -> flo
     sheep_eaten = info.get("sheep_eaten", 0)
     wolf_killed = info.get("wolf_killed", False)
     
-    reward += float(sheep_entered) * 200.0
-    reward -= float(sheep_eaten) * 150.0
-    reward += float(wolf_killed) * 150.0
+    reward += float(sheep_entered) * 110.0
+    reward -= float(sheep_eaten) * 120.0
+    reward += float(wolf_killed) * 70.0
     
     # Dense shaping rewards
     sheep_positions = info.get("sheep_positions", None)

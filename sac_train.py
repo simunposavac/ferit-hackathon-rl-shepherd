@@ -53,7 +53,7 @@ MAX_STEPS_PER_EPISODE = 2000 # max steps per episode
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 TRAIN_DOG = True
-TRAIN_WOLF = True
+TRAIN_WOLF = False
 
 
 # SAC hyperparameters
@@ -65,7 +65,7 @@ ALPHA_LR = 3e-4      # Temperature learning rate
 
 GAMMA = 0.99         # Discount factor (importance of future rewards)
 TAU = 0.005          # Target network soft-update rate. How fast the target critics track the main critics (0.005 - stable, 0.01 - tracks faster)
-BATCH_SIZE = 128     # [64 - 256] Minibatch size from replay for each SGD step, Bigger = smoother gradients but more VRAM
+BATCH_SIZE = 256     # [64 - 256] Minibatch size from replay for each SGD step, Bigger = smoother gradients but more VRAM
 REPLAY_CAPACITY = 250_000 # [100k - 500k] Max transitions stored in replay buffer, Larger = more diverse data
 WARMUP_STEPS = 5_000 # Number of env steps collected before any learning (reduced for faster training start)
 STEPS_PER_UPDATE = 4 # Do 1 update every N environment steps (reduced for more frequent updates)
@@ -578,9 +578,9 @@ def dog_reward_fn(info: Dict[str, any], prev_info: Dict[str, any]=None) -> float
     wolf_killed = info.get("wolf_killed", False)
     
     # Big rewards/penalties for main events
-    reward += float(sheep_entered) * 150.0  # Major reward for saving sheep
+    reward += float(sheep_entered) * 110.0  # Major reward for saving sheep
     reward -= float(sheep_eaten) * 120.0     # Major penalty when wolf eats sheep
-    reward += float(wolf_killed) * 80.0      # Bonus for killing wolf
+    reward += float(wolf_killed) * 70.0      # Bonus for killing wolf
     
     # Dense shaping rewards (help learning when sparse rewards are rare)
     sheep_positions = info.get("sheep_positions", None)
@@ -604,7 +604,7 @@ def dog_reward_fn(info: Dict[str, any], prev_info: Dict[str, any]=None) -> float
                 prev_dists_to_pen = np.linalg.norm(prev_sheep_pos - pen_center, axis=1)
                 curr_dists_to_pen = np.linalg.norm(sheep_positions - pen_center, axis=1)
                 progress = float(np.mean(prev_dists_to_pen - curr_dists_to_pen))
-                reward += progress * 0.08  # Reward progress toward pen
+                reward += progress * 0.16  # Reward progress toward pen
         
         # Bonus for positioning between wolf and sheep (protective behavior)
         if wolf_pos is not None and not info.get("wolf_is_dead", False):
