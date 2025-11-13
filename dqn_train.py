@@ -57,12 +57,12 @@ TRAIN_WOLF = True
 LR = 3e-4           # Learning rate for Q-network
 GAMMA = 0.99        # Discount factor (importance of future rewards)
 TAU = 0.005         # Target network soft-update rate (unused for hard updates)
-BATCH_SIZE = 384    # OPTIMIZED: Large batch size to utilize RTX 3060 (reduced from 512 to prevent slowdown)
-REPLAY_CAPACITY = 500_000  # OPTIMIZED: Larger buffer for more diverse samples (was 250k)
-WARMUP_STEPS = 5_000  # OPTIMIZED: More warmup for better initial samples (was 3k)
-UPDATE_EVERY = 1    # OPTIMIZED: Update every step (was 2) - we do multiple updates per trigger
-MAX_UPDATES_PER_STEP = 2  # OPTIMIZED: Do 2 updates when triggered (reduced from 4 to prevent slowdown)
-TARGET_UPDATE_EVERY = 200  # OPTIMIZED: Update target network every N updates (hard update, was 100)
+BATCH_SIZE = 128    # OPTIMIZED: Balanced batch size for stable training (reduced to prevent slowdown)
+REPLAY_CAPACITY = 250_000  # OPTIMIZED: Reasonable buffer size (reduced to prevent memory issues)
+WARMUP_STEPS = 3_000  # OPTIMIZED: Standard warmup period
+UPDATE_EVERY = 4    # OPTIMIZED: Update every 4 steps (reduces update frequency to prevent slowdown)
+MAX_UPDATES_PER_STEP = 1  # OPTIMIZED: Single update per trigger (prevents GPU queue buildup)
+TARGET_UPDATE_EVERY = 100  # OPTIMIZED: Update target network every N updates (hard update)
 EPSILON_START = 1.0  # Initial exploration rate
 EPSILON_END = 0.01   # Final exploration rate
 EPSILON_DECAY = 0.995  # Epsilon decay per episode
@@ -207,15 +207,16 @@ class ReplayBuffer:
         self.size = min(self.size + 1, self.capacity)
 
     def sample(self, batch_size: int):
-        # OPTIMIZED: Use torch.from_numpy for faster conversion (shares memory, non-blocking transfer)
+        # OPTIMIZED: Use torch.as_tensor for faster conversion (avoids unnecessary copies)
         idxs = np.random.randint(0, self.size, size=batch_size)
-        obs = torch.from_numpy(self.obs_buf[idxs]).to(self.device, non_blocking=True)
-        pen = torch.from_numpy(self.pen_buf[idxs]).to(self.device, non_blocking=True)
-        act = torch.from_numpy(self.act_buf[idxs]).to(self.device, non_blocking=True)
-        rew = torch.from_numpy(self.rew_buf[idxs]).to(self.device, non_blocking=True)
-        next_obs = torch.from_numpy(self.next_obs_buf[idxs]).to(self.device, non_blocking=True)
-        next_pen = torch.from_numpy(self.next_pen_buf[idxs]).to(self.device, non_blocking=True)
-        done = torch.from_numpy(self.done_buf[idxs]).to(self.device, non_blocking=True)
+        # Use as_tensor which is faster than from_numpy for contiguous arrays
+        obs = torch.as_tensor(self.obs_buf[idxs], device=self.device)
+        pen = torch.as_tensor(self.pen_buf[idxs], device=self.device)
+        act = torch.as_tensor(self.act_buf[idxs], device=self.device)
+        rew = torch.as_tensor(self.rew_buf[idxs], device=self.device)
+        next_obs = torch.as_tensor(self.next_obs_buf[idxs], device=self.device)
+        next_pen = torch.as_tensor(self.next_pen_buf[idxs], device=self.device)
+        done = torch.as_tensor(self.done_buf[idxs], device=self.device)
         return obs, pen, act, rew, next_obs, next_pen, done
 
 
@@ -239,12 +240,12 @@ class DQNAgent(BaseAgent):
         tau=0.005,
         lr=3e-4,
         hidden_dim=512,
-        buffer_capacity=500_000,
-        batch_size=512,
-        update_every=1,
-        max_updates_per_step=4,
-        target_update_every=200,
-        learning_starts=5_000,
+        buffer_capacity=250_000,
+        batch_size=128,
+        update_every=4,
+        max_updates_per_step=1,
+        target_update_every=100,
+        learning_starts=3_000,
         epsilon_start=1.0,
         epsilon_end=0.01,
         epsilon_decay=0.995,
@@ -356,16 +357,14 @@ class DQNAgent(BaseAgent):
 
         self.total_steps += 1
 
-        # OPTIMIZED: Begin learning after warmup, do multiple updates per trigger
+        # OPTIMIZED: Begin learning after warmup
         if self.replay.size >= self.learning_starts and (self.total_steps % self.update_every == 0):
-            # Do multiple updates to utilize GPU fully
-            for _ in range(self.max_updates_per_step):
-                self._update()
+            # Single update per trigger to prevent slowdown
+            self._update()
             
-            # Periodic memory cleanup to prevent slowdown (every 100 updates)
-            if self.update_count % 100 == 0 and self.device == 'cuda':
+            # Less frequent memory cleanup (every 500 updates to reduce overhead)
+            if self.update_count % 500 == 0 and self.device == 'cuda':
                 torch.cuda.empty_cache()
-                torch.cuda.synchronize()  # Ensure GPU operations complete
 
     def _update(self):
         # OPTIMIZED: Sample batch (already on GPU from ReplayBuffer)
@@ -406,8 +405,8 @@ class DQNAgent(BaseAgent):
                 for target_param, param in zip(self.target_network.parameters(), self.q_network.parameters()):
                     target_param.data.copy_(param.data)
         
-        # Clean up intermediate tensors to prevent memory buildup
-        del obs, pen, act, rew, next_obs, next_pen, done, q_values, q_selected, loss
+        # Clean up intermediate tensors to prevent memory buildup (only delete if not needed)
+        # Note: Python GC will handle this, explicit del can sometimes cause overhead
 
     def episode_start(self):
         pass
@@ -416,9 +415,11 @@ class DQNAgent(BaseAgent):
         # Decay epsilon
         self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
         
-        # Periodic GPU memory cleanup after each episode
-        if self.device == 'cuda':
-            torch.cuda.empty_cache()
+        # Less frequent GPU memory cleanup (every 10 episodes to reduce overhead)
+        # if self.device == 'cuda' and hasattr(self, '_episode_count'):
+        #     self._episode_count = getattr(self, '_episode_count', 0) + 1
+        #     if self._episode_count % 10 == 0:
+        #         torch.cuda.empty_cache()
 
     def save(self, path: str, include_replay: bool = False, max_replay_items: int = 0) -> None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -743,13 +744,12 @@ def train(
     print(f"Action space: {NUM_FORWARD_SPEEDS} forward speeds × {NUM_TURN_RATES} turn rates")
     print()
     print("OPTIMIZATIONS ENABLED:")
-    print(f"  - Batch size: {BATCH_SIZE} (optimized to prevent slowdown)")
-    print(f"  - Updates per step: {MAX_UPDATES_PER_STEP} - Multiple updates per trigger")
-    print(f"  - Replay buffer: {REPLAY_CAPACITY:,} capacity - More diverse samples")
+    print(f"  - Batch size: {BATCH_SIZE} (balanced for stable training)")
+    print(f"  - Updates per step: {MAX_UPDATES_PER_STEP} - Single update per trigger")
+    print(f"  - Replay buffer: {REPLAY_CAPACITY:,} capacity")
     print(f"  - Update frequency: Every {UPDATE_EVERY} step(s)")
     print(f"  - Mixed precision: Enabled (AMP)")
     print(f"  - cuDNN benchmark: Enabled")
-    print(f"  - Memory management: Periodic cleanup enabled")
     print(f"  - torch.compile: Disabled (requires Triton - can enable if available)")
     if not headless:
         status = "disabled" if render_every_n_steps == 0 else f"every {render_every_n_steps} steps"
