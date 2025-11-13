@@ -283,13 +283,20 @@ class DQNAgent(BaseAgent):
         self.target_network.load_state_dict(self.q_network.state_dict())
         
         # OPTIMIZATION: Compile network for faster execution (PyTorch 2.0+)
+        # Check if Triton is available before attempting compilation
+        self._is_compiled = False
         if use_torch_compile and device == 'cuda' and hasattr(torch, 'compile'):
             try:
+                # Try to import triton to check if it's available
+                import triton
                 print(f"Compiling {agent_type} Q-network with torch.compile for faster execution...")
                 self.q_network = torch.compile(self.q_network, mode='reduce-overhead')
+                self._is_compiled = True
                 print(f"Successfully compiled {agent_type} Q-network!")
+            except ImportError:
+                print(f"Info: Triton not available for {agent_type}. torch.compile disabled. Training will still work but may be slightly slower.")
             except Exception as e:
-                print(f"Warning: torch.compile failed for {agent_type}: {e}. Continuing without compilation.")
+                print(f"Warning: torch.compile failed for {agent_type}: {str(e)[:100]}. Continuing without compilation.")
         
         # Set target network to eval mode (no gradients needed)
         self.target_network.eval()
@@ -729,9 +736,8 @@ def train(
     print(f"  - Replay buffer: {REPLAY_CAPACITY:,} capacity - More diverse samples")
     print(f"  - Update frequency: Every {UPDATE_EVERY} step(s)")
     print(f"  - Mixed precision: Enabled (AMP)")
-    if device == 'cuda' and hasattr(torch, 'compile'):
-        print(f"  - torch.compile: Enabled (PyTorch 2.0+)")
     print(f"  - cuDNN benchmark: Enabled")
+    print(f"  - torch.compile: Disabled (requires Triton - can enable if available)")
     if not headless:
         status = "disabled" if render_every_n_steps == 0 else f"every {render_every_n_steps} steps"
         print(f"Rendering: {status} (press H to toggle 0 ↔ 20)")
@@ -766,7 +772,7 @@ def train(
         epsilon_decay=EPSILON_DECAY,
         pen_vec_dim=2,
         num_actions=NUM_ACTIONS,
-        use_torch_compile=True  # OPTIMIZED: Enable torch.compile for faster execution
+        use_torch_compile=False  # DISABLED: Requires Triton (can cause issues on some systems)
     )
 
     if TRAIN_DOG or LOAD_DOG_CHECKPOINT:
