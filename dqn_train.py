@@ -115,46 +115,46 @@ def find_latest_checkpoint(save_dir: str, agent_type: str) -> str | None:
     # Sort by datetime (newest first)
     timestamped_folders.sort(key=lambda x: x[1], reverse=True)
     
-    # Get the latest folder
-    latest_folder_path = timestamped_folders[0][0]
-    print(f"Found latest timestamped folder: {latest_folder_path}")
-    
-    # Now find the latest episode checkpoint in this folder
+    # Search through folders from newest to oldest until we find one with checkpoints
     final_pattern = f"{agent_type}_dqn_final.pth"
-    episode_checkpoints = []
     
-    if os.path.exists(latest_folder_path):
-        try:
-            files = os.listdir(latest_folder_path)
-        except OSError:
-            print(f"Cannot read folder: {latest_folder_path}")
-            return None
-            
-        for file in files:
-            if not file.endswith(".pth"):
+    for folder_path, folder_datetime, timestamp_str in timestamped_folders:
+        print(f"Checking folder: {folder_path}")
+        episode_checkpoints = []
+        
+        if os.path.exists(folder_path):
+            try:
+                files = os.listdir(folder_path)
+            except OSError:
+                print(f"Cannot read folder: {folder_path}")
                 continue
                 
-            file_path = os.path.join(latest_folder_path, file)
-            
-            if file == final_pattern:
-                # Final checkpoint - prefer this (highest priority)
-                print(f"Found final checkpoint: {file_path}")
-                return file_path
-            elif file.startswith(f"{agent_type}_dqn_episode_") and file.endswith(".pth"):
-                # Extract episode number
-                try:
-                    ep_num = int(file.split("_")[-1].replace(".pth", ""))
-                    episode_checkpoints.append((file_path, ep_num))
-                except ValueError:
+            for file in files:
+                if not file.endswith(".pth"):
                     continue
+                    
+                file_path = os.path.join(folder_path, file)
+                
+                if file == final_pattern:
+                    # Final checkpoint - prefer this (highest priority)
+                    print(f"Found final checkpoint: {file_path}")
+                    return file_path
+                elif file.startswith(f"{agent_type}_dqn_episode_") and file.endswith(".pth"):
+                    # Extract episode number
+                    try:
+                        ep_num = int(file.split("_")[-1].replace(".pth", ""))
+                        episode_checkpoints.append((file_path, ep_num))
+                    except ValueError:
+                        continue
+        
+        # If we found checkpoints in this folder, return the highest episode
+        if episode_checkpoints:
+            episode_checkpoints.sort(key=lambda x: x[1], reverse=True)
+            print(f"Found episode checkpoint: {episode_checkpoints[0][0]} (episode {episode_checkpoints[0][1]})")
+            return episode_checkpoints[0][0]
     
-    # If no final checkpoint, return the highest episode number
-    if episode_checkpoints:
-        episode_checkpoints.sort(key=lambda x: x[1], reverse=True)
-        print(f"Found episode checkpoint: {episode_checkpoints[0][0]} (episode {episode_checkpoints[0][1]})")
-        return episode_checkpoints[0][0]
-    
-    print(f"No {agent_type} checkpoints found in {latest_folder_path}")
+    # No checkpoints found in any timestamped folder
+    print(f"No {agent_type} checkpoints found in any timestamped folder")
     return None
 
 # ============================================================================
