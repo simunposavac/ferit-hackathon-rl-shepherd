@@ -11,6 +11,7 @@ FIXED VERSION - Improvements:
 from __future__ import annotations
 
 import datetime
+import re
 from typing import List, Sequence, Tuple, Dict, Any, Optional
 
 import os
@@ -47,8 +48,9 @@ WOLF_CHECKPOINT_PATH = r"saves/dqn/best_wolf.pth"
 
 def find_latest_checkpoint(save_dir: str, agent_type: str) -> str | None:
     """
-    Find the latest checkpoint file for an agent by searching all timestamped folders.
-    Prefers the most recently modified checkpoint (by file modification time).
+    Find the latest checkpoint file for an agent by:
+    1. Finding the latest timestamped folder (by date/time in folder name)
+    2. Inside that folder, finding the highest episode number checkpoint
     
     Args:
         save_dir: Directory to search (e.g., 'saves/dqn')
@@ -60,39 +62,61 @@ def find_latest_checkpoint(save_dir: str, agent_type: str) -> str | None:
     if not os.path.exists(save_dir):
         return None
     
-    # Pattern: {agent_type}_dqn_episode_{number}.pth or {agent_type}_dqn_final.pth
+    # Pattern for timestamped folders: YYYY-MM-DD_HH-MM-SS
+    timestamp_pattern = re.compile(r'(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})')
+    
+    # Find all timestamped folders
+    timestamped_folders = []
+    for item in os.listdir(save_dir):
+        item_path = os.path.join(save_dir, item)
+        if os.path.isdir(item_path):
+            match = timestamp_pattern.search(item)
+            if match:
+                timestamp_str = match.group(1)
+                try:
+                    # Parse timestamp to datetime for sorting
+                    folder_datetime = datetime.datetime.strptime(timestamp_str, "%Y-%m-%d_%H-%M-%S")
+                    timestamped_folders.append((item_path, folder_datetime, timestamp_str))
+                except ValueError:
+                    continue
+    
+    if not timestamped_folders:
+        return None
+    
+    # Sort by datetime (newest first)
+    timestamped_folders.sort(key=lambda x: x[1], reverse=True)
+    
+    # Get the latest folder
+    latest_folder_path = timestamped_folders[0][0]
+    
+    # Now find the latest episode checkpoint in this folder
     final_pattern = f"{agent_type}_dqn_final.pth"
+    episode_checkpoints = []
     
-    all_checkpoints = []  # List of (path, episode_num, mtime, is_final)
-    
-    # Search in all subdirectories (timestamp folders)
-    for root, dirs, files in os.walk(save_dir):
-        for file in files:
-            path = os.path.join(root, file)
-            if not os.path.exists(path):
+    if os.path.exists(latest_folder_path):
+        for file in os.listdir(latest_folder_path):
+            if not file.endswith(".pth"):
                 continue
                 
-            mtime = os.path.getmtime(path)
+            file_path = os.path.join(latest_folder_path, file)
             
             if file == final_pattern:
-                # Final checkpoint - treat as episode number 999999 for sorting
-                all_checkpoints.append((path, 999999, mtime, True))
+                # Final checkpoint - prefer this (highest priority)
+                return file_path
             elif file.startswith(f"{agent_type}_dqn_episode_") and file.endswith(".pth"):
                 # Extract episode number
                 try:
                     ep_num = int(file.split("_")[-1].replace(".pth", ""))
-                    all_checkpoints.append((path, ep_num, mtime, False))
+                    episode_checkpoints.append((file_path, ep_num))
                 except ValueError:
                     continue
     
-    if not all_checkpoints:
-        return None
+    # If no final checkpoint, return the highest episode number
+    if episode_checkpoints:
+        episode_checkpoints.sort(key=lambda x: x[1], reverse=True)
+        return episode_checkpoints[0][0]
     
-    # Sort by: 1) modification time (newest first), 2) episode number (higher first)
-    # This ensures we get the most recently saved checkpoint
-    all_checkpoints.sort(key=lambda x: (x[2], x[1]), reverse=True)
-    
-    return all_checkpoints[0][0]
+    return None
 
 # ============================================================================
 # TRAINING CONFIGURATION
