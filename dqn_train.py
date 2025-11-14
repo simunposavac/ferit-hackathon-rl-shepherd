@@ -727,11 +727,36 @@ def wolf_reward_fn(info, prev_info=None) -> float:
     wolf_is_dead = info.get("wolf_is_dead", False)
     sheep_entered_pen = info.get("sheep_entered_pen", 0)
     
+    # Get positions early for distance calculations
+    wolf_pos = info.get("wolf_position", None)
+    pen_center = info.get("pen_center", None)
+    
     # ========================================================================
-    # 1. REWARD: Eating sheep
+    # 1. REWARD: Eating sheep (scaled by distance to pen)
     # ========================================================================
     if sheep_eaten > 0:
-        reward += float(sheep_eaten) * 200.0
+        base_reward = 200.0
+        # Scale reward based on distance to pen: closer to pen = smaller reward
+        if wolf_pos is not None and pen_center is not None:
+            wolf_to_pen_dist = float(np.linalg.norm(wolf_pos - pen_center))
+            # Define thresholds: close to pen (< 300) = reduced reward, far (> 500) = full reward
+            close_threshold = 300.0  # Within this distance, reward is reduced
+            far_threshold = 500.0   # Beyond this distance, full reward
+            
+            if wolf_to_pen_dist < close_threshold:
+                # Very close to pen: minimal reward (20% of base)
+                distance_factor = 0.2 + (wolf_to_pen_dist / close_threshold) * 0.3  # 0.2 to 0.5
+            elif wolf_to_pen_dist < far_threshold:
+                # Medium distance: partial reward (50% to 100%)
+                distance_factor = 0.5 + ((wolf_to_pen_dist - close_threshold) / (far_threshold - close_threshold)) * 0.5
+            else:
+                # Far from pen: full reward
+                distance_factor = 1.0
+            
+            reward += float(sheep_eaten) * base_reward * distance_factor
+        else:
+            # Fallback if positions not available
+            reward += float(sheep_eaten) * base_reward
     
     # ========================================================================
     # 2. PENALTY: Wolf killed/eaten
@@ -747,10 +772,9 @@ def wolf_reward_fn(info, prev_info=None) -> float:
     
     if not wolf_is_dead:
         sheep_positions = info.get("sheep_positions", None)
-        wolf_pos = info.get("wolf_position", None)
+        # wolf_pos and pen_center already retrieved above
         wolf_velocity = info.get("wolf_velocity", None)
         dog_pos = info.get("dog_position", None)
-        pen_center = info.get("pen_center", None)
         
         if sheep_positions is not None and len(sheep_positions) > 0 and wolf_pos is not None:
             # ========================================================================
@@ -839,23 +863,39 @@ def wolf_reward_fn(info, prev_info=None) -> float:
                             reward -= alignment_to_dog * 0.4  # Additional penalty
             
             # ========================================================================
-            # 7. ADDITIONAL: Reward for keeping sheep away from pen
+            # 7. REWARD: Pushing sheep away from pen (stronger when close to pen)
             # ========================================================================
-            if pen_center is not None:
+            if pen_center is not None and wolf_pos is not None:
+                wolf_to_pen_dist = float(np.linalg.norm(wolf_pos - pen_center))
                 sheep_dists_to_pen = np.linalg.norm(sheep_positions - pen_center, axis=1)
                 avg_dist_to_pen = float(np.mean(sheep_dists_to_pen))
                 
-                # Reward for sheep being far from pen
+                # Base reward for sheep being far from pen
                 reward += min(avg_dist_to_pen / 600.0, 1.0) * 0.2
                 
-                # Reward for pushing sheep further from pen
+                # Reward for pushing sheep further from pen (stronger when wolf is close to pen)
                 if prev_info is not None:
                     prev_sheep_pos = prev_info.get("sheep_positions", None)
                     if prev_sheep_pos is not None and len(prev_sheep_pos) == len(sheep_positions):
                         prev_dists_to_pen = np.linalg.norm(prev_sheep_pos - pen_center, axis=1)
                         prev_avg_dist = float(np.mean(prev_dists_to_pen))
                         if avg_dist_to_pen > prev_avg_dist:  # Sheep moving away from pen
-                            reward += (avg_dist_to_pen - prev_avg_dist) * 0.15
+                            progress = avg_dist_to_pen - prev_avg_dist
+                            
+                            # Scale reward based on wolf's distance to pen
+                            # Closer to pen = stronger reward for pushing away
+                            close_threshold = 300.0
+                            if wolf_to_pen_dist < close_threshold:
+                                # Very close to pen: strong reward for pushing away (2x multiplier)
+                                distance_multiplier = 2.0 - (wolf_to_pen_dist / close_threshold)  # 2.0 to 1.0
+                            elif wolf_to_pen_dist < 500.0:
+                                # Medium distance: moderate reward
+                                distance_multiplier = 1.0 - ((wolf_to_pen_dist - close_threshold) / 200.0) * 0.5  # 1.0 to 0.5
+                            else:
+                                # Far from pen: smaller reward (can eat instead)
+                                distance_multiplier = 0.5
+                            
+                            reward += progress * 0.15 * distance_multiplier
             
             # ========================================================================
             # 8. ADDITIONAL: Reward for getting close to sheep (hunting behavior)
