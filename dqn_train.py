@@ -47,7 +47,8 @@ WOLF_CHECKPOINT_PATH = r"saves/dqn/best_wolf.pth"
 
 def find_latest_checkpoint(save_dir: str, agent_type: str) -> str | None:
     """
-    Find the latest checkpoint file for an agent.
+    Find the latest checkpoint file for an agent by searching all timestamped folders.
+    Prefers the most recently modified checkpoint (by file modification time).
     
     Args:
         save_dir: Directory to search (e.g., 'saves/dqn')
@@ -60,30 +61,38 @@ def find_latest_checkpoint(save_dir: str, agent_type: str) -> str | None:
         return None
     
     # Pattern: {agent_type}_dqn_episode_{number}.pth or {agent_type}_dqn_final.pth
-    pattern = f"{agent_type}_dqn_episode_*.pth"
     final_pattern = f"{agent_type}_dqn_final.pth"
     
-    latest_episode = -1
-    latest_path = None
+    all_checkpoints = []  # List of (path, episode_num, mtime, is_final)
     
     # Search in all subdirectories (timestamp folders)
     for root, dirs, files in os.walk(save_dir):
         for file in files:
-            if file == final_pattern.replace('*', ''):
-                # Final checkpoint - prefer this
-                path = os.path.join(root, file)
-                return path
+            path = os.path.join(root, file)
+            if not os.path.exists(path):
+                continue
+                
+            mtime = os.path.getmtime(path)
+            
+            if file == final_pattern:
+                # Final checkpoint - treat as episode number 999999 for sorting
+                all_checkpoints.append((path, 999999, mtime, True))
             elif file.startswith(f"{agent_type}_dqn_episode_") and file.endswith(".pth"):
                 # Extract episode number
                 try:
                     ep_num = int(file.split("_")[-1].replace(".pth", ""))
-                    if ep_num > latest_episode:
-                        latest_episode = ep_num
-                        latest_path = os.path.join(root, file)
+                    all_checkpoints.append((path, ep_num, mtime, False))
                 except ValueError:
                     continue
     
-    return latest_path
+    if not all_checkpoints:
+        return None
+    
+    # Sort by: 1) modification time (newest first), 2) episode number (higher first)
+    # This ensures we get the most recently saved checkpoint
+    all_checkpoints.sort(key=lambda x: (x[2], x[1]), reverse=True)
+    
+    return all_checkpoints[0][0]
 
 # ============================================================================
 # TRAINING CONFIGURATION
@@ -548,72 +557,169 @@ class DQNAgent(BaseAgent):
 # ============================================================================
 
 def dog_reward_fn(info: Dict[str, any], prev_info: Dict[str, any] = None) -> float:
-    """Dog reward function: Get sheep into pen, kill wolf."""
+    """
+    Dog reward function: Get most sheep into pen, protect from wolf.
+    Mission: Guide sheep to pen while avoiding entering cluster and protecting from wolf.
+    """
     reward = 0.0
 
-    # Main objectives
+    # Get state information
     sheep_entered = info.get("sheep_entered_pen", 0)
     sheep_eaten = info.get("sheep_eaten", 0)
     wolf_killed = info.get("wolf_killed", False)
-    
-    reward += float(sheep_entered) * 110.0
-    reward -= float(sheep_eaten) * 120.0
-    reward += float(wolf_killed) * 70.0
-    
-    # Dense shaping rewards
     sheep_positions = info.get("sheep_positions", None)
     dog_pos = info.get("dog_position", None)
+    dog_velocity = info.get("dog_velocity", None)
     wolf_pos = info.get("wolf_position", None)
     pen_center = info.get("pen_center", None)
     
+    # ========================================================================
+    # 1. SHEEP ENTERING PEN REWARD (with FOV check)
+    # ========================================================================
+    if sheep_entered > 0:
+        # Check if dog can see the pen (within FOV/distance)
+        dog_can_see_pen = False
+        if dog_pos is not None and pen_center is not None:
+            dog_to_pen = pen_center - dog_pos
+            dist_to_pen = np.linalg.norm(dog_to_pen)
+            max_vision_range = 350.0  # FOV range
+            if dist_to_pen < max_vision_range:
+                dog_can_see_pen = True
+        
+        if dog_can_see_pen:
+            reward += float(sheep_entered) * 110.0  # Full reward
+        else:
+            reward += float(sheep_entered) * 110.0 * 0.15  # Only 15% if not seen
+    
+    # ========================================================================
+    # 2. WOLF KILLED REWARD
+    # ========================================================================
+    if wolf_killed:
+        reward += 70.0
+    
+    # ========================================================================
+    # 3. PENALTY FOR SHEEP EATEN
+    # ========================================================================
+    if sheep_eaten > 0:
+        reward -= float(sheep_eaten) * 120.0
+    
     if sheep_positions is not None and len(sheep_positions) > 0 and dog_pos is not None and pen_center is not None:
-        sheep_dists_to_dog = np.linalg.norm(sheep_positions - dog_pos, axis=1)
-        sheep_dists_to_pen = np.linalg.norm(sheep_positions - pen_center, axis=1)
-        avg_sheep_dist_to_dog = float(np.mean(sheep_dists_to_dog))
-        avg_sheep_dist_to_pen = float(np.mean(sheep_dists_to_pen))
+        # ========================================================================
+        # 4. REWARD: Dog vector close to collinear with vector from dog to pen
+        # ========================================================================
+        if dog_velocity is not None and np.linalg.norm(dog_velocity) > 0.1:
+            dog_velocity_normalized = dog_velocity / np.linalg.norm(dog_velocity)
+            dog_to_pen = pen_center - dog_pos
+            dog_to_pen_norm = np.linalg.norm(dog_to_pen)
+            
+            if dog_to_pen_norm > 1.0:
+                dog_to_pen_normalized = dog_to_pen / dog_to_pen_norm
+                alignment = np.dot(dog_velocity_normalized, dog_to_pen_normalized)
+                # Reward when close to collinear (alignment close to 1.0)
+                if alignment > 0.7:  # Close to collinear
+                    reward += alignment * 0.3  # Stronger reward for better alignment
         
-        dog_dist_to_pen = float(np.linalg.norm(dog_pos - pen_center))
+        # ========================================================================
+        # 5. CLUSTER DETECTION AND PENALTY: Punish dog if entering cluster
+        # ========================================================================
+        # Calculate cluster center and radius (using smaller radius for manipulation)
+        if len(sheep_positions) >= 2:
+            cluster_center = np.mean(sheep_positions, axis=0)
+            sheep_dists_to_cluster = np.linalg.norm(sheep_positions - cluster_center, axis=1)
+            actual_cluster_radius = float(np.max(sheep_dists_to_cluster)) if len(sheep_dists_to_cluster) > 0 else 0.0
+            
+            # Use smaller radius (70% of actual) to allow manipulation but prevent splitting
+            effective_cluster_radius = actual_cluster_radius * 0.7
+            
+            dog_dist_to_cluster = float(np.linalg.norm(dog_pos - cluster_center))
+            
+            # Penalty if dog enters inside the effective cluster radius
+            if dog_dist_to_cluster < effective_cluster_radius:
+                # Stronger penalty the deeper inside the cluster
+                penetration = 1.0 - (dog_dist_to_cluster / max(effective_cluster_radius, 1.0))
+                reward -= penetration * 0.5  # Penalty for entering cluster
         
+        # ========================================================================
+        # 6. REWARD: Dog coming to wolf when wolf is eating sheep
+        # ========================================================================
+        if wolf_pos is not None and not info.get("wolf_is_dead", False):
+            wolf_to_dog = np.linalg.norm(dog_pos - wolf_pos)
+            wolf_is_eating = info.get("wolf_just_ate", False) or sheep_eaten > 0
+            
+            if wolf_is_eating and wolf_to_dog < 200.0:  # Wolf is eating and dog is close
+                # Reward for being close to wolf when it's eating
+                proximity_reward = (1.0 - wolf_to_dog / 200.0) * 0.4
+                reward += proximity_reward
+                
+                # Additional reward if dog is moving toward wolf
+                if dog_velocity is not None and np.linalg.norm(dog_velocity) > 0.1:
+                    dog_to_wolf = wolf_pos - dog_pos
+                    dog_to_wolf_norm = np.linalg.norm(dog_to_wolf)
+                    if dog_to_wolf_norm > 1.0:
+                        dog_to_wolf_normalized = dog_to_wolf / dog_to_wolf_norm
+                        dog_velocity_normalized = dog_velocity / np.linalg.norm(dog_velocity)
+                        alignment_to_wolf = np.dot(dog_velocity_normalized, dog_to_wolf_normalized)
+                        if alignment_to_wolf > 0.5:  # Moving toward wolf
+                            reward += alignment_to_wolf * 0.3
+        
+        # ========================================================================
+        # 7. PENALTY: Dog pushing sheep perpendicular from pen vector
+        # ========================================================================
+        if dog_velocity is not None and np.linalg.norm(dog_velocity) > 0.1 and prev_info is not None:
+            dog_velocity_normalized = dog_velocity / np.linalg.norm(dog_velocity)
+            dog_to_pen = pen_center - dog_pos
+            dog_to_pen_norm = np.linalg.norm(dog_to_pen)
+            
+            if dog_to_pen_norm > 1.0:
+                dog_to_pen_normalized = dog_to_pen / dog_to_pen_norm
+                
+                # Check if sheep are in front of dog
+                prev_sheep_pos = prev_info.get("sheep_positions", None)
+                if prev_sheep_pos is not None and len(prev_sheep_pos) == len(sheep_positions):
+                    sheep_in_front = 0
+                    for i, sheep_pos in enumerate(sheep_positions):
+                        dog_to_sheep = sheep_pos - dog_pos
+                        dist_to_sheep = np.linalg.norm(dog_to_sheep)
+                        if dist_to_sheep > 1.0:
+                            dog_to_sheep_normalized = dog_to_sheep / dist_to_sheep
+                            front_score = np.dot(dog_velocity_normalized, dog_to_sheep_normalized)
+                            if front_score > 0.3 and dist_to_sheep < 250.0:  # Sheep in front
+                                sheep_in_front += 1
+                                
+                                # Check if dog is pushing perpendicular to pen direction
+                                perpendicular_score = abs(np.dot(dog_velocity_normalized, 
+                                                                  np.array([-dog_to_pen_normalized[1], 
+                                                                           dog_to_pen_normalized[0]])))
+                                if perpendicular_score > 0.7:  # Close to perpendicular
+                                    # Check if sheep moved away from pen
+                                    prev_dist_to_pen = np.linalg.norm(prev_sheep_pos[i] - pen_center)
+                                    curr_dist_to_pen = np.linalg.norm(sheep_pos - pen_center)
+                                    if curr_dist_to_pen > prev_dist_to_pen:  # Moving away
+                                        reward -= 0.3  # Penalty for pushing perpendicular
+        
+        # ========================================================================
+        # 8. ADDITIONAL: Reward for overall progress toward pen
+        # ========================================================================
         if prev_info is not None:
             prev_sheep_pos = prev_info.get("sheep_positions", None)
             if prev_sheep_pos is not None and len(prev_sheep_pos) == len(sheep_positions):
                 prev_dists_to_pen = np.linalg.norm(prev_sheep_pos - pen_center, axis=1)
-                progress = float(np.mean(prev_dists_to_pen - sheep_dists_to_pen))
-                reward += progress * 0.12
-        
-        if avg_sheep_dist_to_pen < dog_dist_to_pen:
-            reward += 0.2
-        
-        sheep_spread = float(np.std(sheep_dists_to_pen))
-        reward += (1.0 - min(sheep_spread / 200.0, 1.0)) * 0.1
-        
-        optimal_herding_dist = 200.0
-        if avg_sheep_dist_to_dog < optimal_herding_dist * 2:
-            reward += (1.0 - min(avg_sheep_dist_to_dog / (optimal_herding_dist * 2), 1.0)) * 0.15
-        
-        if wolf_pos is not None and not info.get("wolf_is_dead", False):
-            wolf_to_dog = float(np.linalg.norm(dog_pos - wolf_pos))
-            wolf_to_sheep_avg = float(np.mean(np.linalg.norm(sheep_positions - wolf_pos, axis=1)))
-            
-            if wolf_to_dog < wolf_to_sheep_avg:
-                reward += 0.25
-            
-            if wolf_to_dog < 150.0:
-                reward += 0.3
-            elif wolf_to_dog < 250.0:
-                reward += 0.15
+                curr_dists_to_pen = np.linalg.norm(sheep_positions - pen_center, axis=1)
+                progress = float(np.mean(prev_dists_to_pen - curr_dists_to_pen))
+                if progress > 0:  # Moving toward pen
+                    reward += progress * 0.1
     
-    total_sheep_in_pen = info.get("total_sheep_in_pen", 0)
-    if total_sheep_in_pen > 0:
-        reward += total_sheep_in_pen * 0.5
-    
+    # Small time penalty
     reward -= 0.01
 
     return reward
 
 
 def wolf_reward_fn(info, prev_info=None) -> float:
-    """Wolf reward function: Eat sheep, distract from pen."""
+    """
+    Wolf reward function: Eat sheep, distract dog from pen.
+    Mission: Push sheep away from pen, eat sheep, avoid dog.
+    """
     reward = 0.0
 
     sheep_eaten = info.get("sheep_eaten", 0)
@@ -621,66 +727,160 @@ def wolf_reward_fn(info, prev_info=None) -> float:
     wolf_is_dead = info.get("wolf_is_dead", False)
     sheep_entered_pen = info.get("sheep_entered_pen", 0)
     
-    reward += float(sheep_eaten) * 200.0
-    reward -= float(wolf_killed) * 150.0
-    reward -= float(sheep_entered_pen) * 80.0
+    # ========================================================================
+    # 1. REWARD: Eating sheep
+    # ========================================================================
+    if sheep_eaten > 0:
+        reward += float(sheep_eaten) * 200.0
+    
+    # ========================================================================
+    # 2. PENALTY: Wolf killed/eaten
+    # ========================================================================
+    if wolf_killed:
+        reward -= 150.0
+    
+    # ========================================================================
+    # 3. PENALTY: Sheep entering pen (dog succeeding)
+    # ========================================================================
+    if sheep_entered_pen > 0:
+        reward -= float(sheep_entered_pen) * 80.0
     
     if not wolf_is_dead:
         sheep_positions = info.get("sheep_positions", None)
         wolf_pos = info.get("wolf_position", None)
+        wolf_velocity = info.get("wolf_velocity", None)
         dog_pos = info.get("dog_position", None)
         pen_center = info.get("pen_center", None)
         
         if sheep_positions is not None and len(sheep_positions) > 0 and wolf_pos is not None:
+            # ========================================================================
+            # 4. PENALTY: Wolf vector close to collinear with pen vector + cluster in front
+            # ========================================================================
+            if wolf_velocity is not None and np.linalg.norm(wolf_velocity) > 0.1 and pen_center is not None:
+                wolf_velocity_normalized = wolf_velocity / np.linalg.norm(wolf_velocity)
+                wolf_to_pen = pen_center - wolf_pos
+                wolf_to_pen_norm = np.linalg.norm(wolf_to_pen)
+                
+                if wolf_to_pen_norm > 1.0:
+                    wolf_to_pen_normalized = wolf_to_pen / wolf_to_pen_norm
+                    alignment_to_pen = np.dot(wolf_velocity_normalized, wolf_to_pen_normalized)
+                    
+                    # Check if wolf is moving toward pen (close to collinear)
+                    if alignment_to_pen > 0.7:  # Close to collinear with pen
+                        # Check if there's a cluster of sheep in front
+                        sheep_in_front_count = 0
+                        for sheep_pos in sheep_positions:
+                            wolf_to_sheep = sheep_pos - wolf_pos
+                            dist_to_sheep = np.linalg.norm(wolf_to_sheep)
+                            if dist_to_sheep > 1.0:
+                                wolf_to_sheep_normalized = wolf_to_sheep / dist_to_sheep
+                                front_score = np.dot(wolf_velocity_normalized, wolf_to_sheep_normalized)
+                                if front_score > 0.3 and dist_to_sheep < 300.0:  # Sheep in front
+                                    sheep_in_front_count += 1
+                        
+                        # If cluster (2+ sheep) in front while moving toward pen, penalize
+                        if sheep_in_front_count >= 2:
+                            reward -= alignment_to_pen * 0.5  # Penalty for guiding sheep to pen
+            
+            # ========================================================================
+            # 5. REWARD: Wolf vector close to opposite from pen vector + sheep in front
+            # ========================================================================
+            if wolf_velocity is not None and np.linalg.norm(wolf_velocity) > 0.1 and pen_center is not None:
+                wolf_velocity_normalized = wolf_velocity / np.linalg.norm(wolf_velocity)
+                wolf_to_pen = pen_center - wolf_pos
+                wolf_to_pen_norm = np.linalg.norm(wolf_to_pen)
+                
+                if wolf_to_pen_norm > 1.0:
+                    wolf_to_pen_normalized = wolf_to_pen / wolf_to_pen_norm
+                    alignment_to_pen = np.dot(wolf_velocity_normalized, wolf_to_pen_normalized)
+                    
+                    # Check if wolf is moving away from pen (opposite direction)
+                    if alignment_to_pen < -0.7:  # Close to opposite from pen
+                        # Check if sheep are in front
+                        sheep_in_front_count = 0
+                        for sheep_pos in sheep_positions:
+                            wolf_to_sheep = sheep_pos - wolf_pos
+                            dist_to_sheep = np.linalg.norm(wolf_to_sheep)
+                            if dist_to_sheep > 1.0:
+                                wolf_to_sheep_normalized = wolf_to_sheep / dist_to_sheep
+                                front_score = np.dot(wolf_velocity_normalized, wolf_to_sheep_normalized)
+                                if front_score > 0.3 and dist_to_sheep < 300.0:  # Sheep in front
+                                    sheep_in_front_count += 1
+                        
+                        # Reward for pushing sheep away from pen
+                        if sheep_in_front_count >= 1:
+                            reward += abs(alignment_to_pen) * 0.4  # Reward for opposite direction
+            
+            # ========================================================================
+            # 6. PENALTY: Wolf going close to dog (avoid dog)
+            # ========================================================================
+            if dog_pos is not None:
+                dog_dist = float(np.linalg.norm(wolf_pos - dog_pos))
+                
+                if dog_dist < 100.0:  # Very close - strong penalty
+                    penalty = (1.0 - dog_dist / 100.0) * 0.6
+                    reward -= penalty
+                elif dog_dist < 150.0:  # Close - moderate penalty
+                    penalty = (1.0 - dog_dist / 150.0) * 0.3
+                    reward -= penalty
+                elif dog_dist < 250.0:  # Moderate distance - small penalty
+                    penalty = (1.0 - dog_dist / 250.0) * 0.1
+                    reward -= penalty
+                
+                # Additional penalty if moving toward dog
+                if wolf_velocity is not None and np.linalg.norm(wolf_velocity) > 0.1:
+                    wolf_to_dog = dog_pos - wolf_pos
+                    wolf_to_dog_norm = np.linalg.norm(wolf_to_dog)
+                    if wolf_to_dog_norm > 1.0:
+                        wolf_to_dog_normalized = wolf_to_dog / wolf_to_dog_norm
+                        wolf_velocity_normalized = wolf_velocity / np.linalg.norm(wolf_velocity)
+                        alignment_to_dog = np.dot(wolf_velocity_normalized, wolf_to_dog_normalized)
+                        if alignment_to_dog > 0.5 and dog_dist < 200.0:  # Moving toward dog
+                            reward -= alignment_to_dog * 0.4  # Additional penalty
+            
+            # ========================================================================
+            # 7. ADDITIONAL: Reward for keeping sheep away from pen
+            # ========================================================================
+            if pen_center is not None:
+                sheep_dists_to_pen = np.linalg.norm(sheep_positions - pen_center, axis=1)
+                avg_dist_to_pen = float(np.mean(sheep_dists_to_pen))
+                
+                # Reward for sheep being far from pen
+                reward += min(avg_dist_to_pen / 600.0, 1.0) * 0.2
+                
+                # Reward for pushing sheep further from pen
+                if prev_info is not None:
+                    prev_sheep_pos = prev_info.get("sheep_positions", None)
+                    if prev_sheep_pos is not None and len(prev_sheep_pos) == len(sheep_positions):
+                        prev_dists_to_pen = np.linalg.norm(prev_sheep_pos - pen_center, axis=1)
+                        prev_avg_dist = float(np.mean(prev_dists_to_pen))
+                        if avg_dist_to_pen > prev_avg_dist:  # Sheep moving away from pen
+                            reward += (avg_dist_to_pen - prev_avg_dist) * 0.15
+            
+            # ========================================================================
+            # 8. ADDITIONAL: Reward for getting close to sheep (hunting behavior)
+            # ========================================================================
             sheep_dists_to_wolf = np.linalg.norm(sheep_positions - wolf_pos, axis=1)
             min_sheep_dist = float(np.min(sheep_dists_to_wolf))
-            avg_sheep_dist = float(np.mean(sheep_dists_to_wolf))
             
-            reward += (1.0 - min(min_sheep_dist / 400.0, 1.0)) * 0.5
+            # Reward for being close to sheep
+            reward += (1.0 - min(min_sheep_dist / 400.0, 1.0)) * 0.3
             
+            # Bonus for being very close (about to eat)
             if min_sheep_dist < 50.0:
-                reward += 0.5
+                reward += 0.4
             
+            # Reward for moving toward sheep
             if prev_info is not None:
                 prev_wolf_pos = prev_info.get("wolf_position", None)
                 prev_sheep_pos = prev_info.get("sheep_positions", None)
                 if prev_wolf_pos is not None and prev_sheep_pos is not None and len(prev_sheep_pos) == len(sheep_positions):
                     prev_min_dist = float(np.min(np.linalg.norm(prev_sheep_pos - prev_wolf_pos, axis=1)))
                     progress = prev_min_dist - min_sheep_dist
-                    reward += progress * 0.08
-            
-            if pen_center is not None:
-                sheep_dists_to_pen = np.linalg.norm(sheep_positions - pen_center, axis=1)
-                avg_dist_to_pen = float(np.mean(sheep_dists_to_pen))
-                
-                reward += min(avg_dist_to_pen / 600.0, 1.0) * 0.2
-                
-                if prev_info is not None:
-                    prev_sheep_pos = prev_info.get("sheep_positions", None)
-                    if prev_sheep_pos is not None and len(prev_sheep_pos) == len(sheep_positions):
-                        prev_dists_to_pen = np.linalg.norm(prev_sheep_pos - pen_center, axis=1)
-                        prev_avg_dist = float(np.mean(prev_dists_to_pen))
-                        if avg_dist_to_pen > prev_avg_dist:
-                            reward += (avg_dist_to_pen - prev_avg_dist) * 0.1
-            
-            if dog_pos is not None:
-                dog_dist = float(np.linalg.norm(wolf_pos - dog_pos))
-                
-                if dog_dist < 100.0:
-                    reward -= (1.0 - dog_dist / 100.0) * 0.5
-                elif dog_dist < 150.0:
-                    reward -= (1.0 - dog_dist / 150.0) * 0.2
-                elif dog_dist < 250.0:
-                    reward -= (1.0 - dog_dist / 250.0) * 0.05
-            
-            if dog_pos is not None and pen_center is not None:
-                wolf_to_dog = float(np.linalg.norm(wolf_pos - dog_pos))
-                wolf_to_sheep_avg = avg_sheep_dist
-                
-                dog_to_sheep_avg = float(np.mean(np.linalg.norm(sheep_positions - dog_pos, axis=1)))
-                if wolf_to_sheep_avg < dog_to_sheep_avg:
-                    reward += 0.15
+                    if progress > 0:  # Moving toward sheep
+                        reward += progress * 0.08
     
+    # Small time penalty
     reward -= 0.01
 
     return reward
@@ -753,38 +953,36 @@ def train(
     if TRAIN_DOG or LOAD_DOG_CHECKPOINT:
         dog_agent = DQNAgent(agent_type="dog", **common_kwargs)
         if LOAD_DOG_CHECKPOINT:
-            # Try to find latest checkpoint if path doesn't exist
-            if not os.path.exists(DOG_CHECKPOINT_PATH):
-                latest = find_latest_checkpoint(SAVE_DIR, "dog")
-                if latest:
-                    print(f"Specified checkpoint not found. Using latest: {latest}")
-                    dog_agent.load(latest)
-                else:
-                    print(f"Warning: No checkpoint found at {DOG_CHECKPOINT_PATH} and no latest checkpoint found.")
-                    print("Starting training from scratch.")
-            else:
-                print(f"Loading dog checkpoint from: {DOG_CHECKPOINT_PATH}")
-                dog_agent.load(DOG_CHECKPOINT_PATH)
-            print("Dog checkpoint loaded successfully!")
+            # Try to find latest checkpoint, fallback to hardcoded path
+            checkpoint_path = find_latest_checkpoint(SAVE_DIR, "dog")
+            if checkpoint_path is None:
+                checkpoint_path = DOG_CHECKPOINT_PATH
+                if not os.path.exists(checkpoint_path):
+                    print(f"Warning: Checkpoint not found at {checkpoint_path}, starting from scratch")
+                    checkpoint_path = None
+            
+            if checkpoint_path:
+                print(f"Loading dog checkpoint from: {checkpoint_path}")
+                dog_agent.load(checkpoint_path)
+                print("Dog checkpoint loaded successfully!")
     else:
         dog_agent = RandomAgent(agent_type="dog", max_value=0)
 
     if TRAIN_WOLF or LOAD_WOLF_CHECKPOINT:
         wolf_agent = DQNAgent(agent_type="wolf", **common_kwargs)
         if LOAD_WOLF_CHECKPOINT:
-            # Try to find latest checkpoint if path doesn't exist
-            if not os.path.exists(WOLF_CHECKPOINT_PATH):
-                latest = find_latest_checkpoint(SAVE_DIR, "wolf")
-                if latest:
-                    print(f"Specified checkpoint not found. Using latest: {latest}")
-                    wolf_agent.load(latest)
-                else:
-                    print(f"Warning: No checkpoint found at {WOLF_CHECKPOINT_PATH} and no latest checkpoint found.")
-                    print("Starting training from scratch.")
-            else:
-                print(f"Loading wolf checkpoint from: {WOLF_CHECKPOINT_PATH}")
-                wolf_agent.load(WOLF_CHECKPOINT_PATH)
-            print("Wolf checkpoint loaded successfully!")
+            # Try to find latest checkpoint, fallback to hardcoded path
+            checkpoint_path = find_latest_checkpoint(SAVE_DIR, "wolf")
+            if checkpoint_path is None:
+                checkpoint_path = WOLF_CHECKPOINT_PATH
+                if not os.path.exists(checkpoint_path):
+                    print(f"Warning: Checkpoint not found at {checkpoint_path}, starting from scratch")
+                    checkpoint_path = None
+            
+            if checkpoint_path:
+                print(f"Loading wolf checkpoint from: {checkpoint_path}")
+                wolf_agent.load(checkpoint_path)
+                print("Wolf checkpoint loaded successfully!")
     else:
         wolf_agent = RandomAgent(agent_type="wolf", max_value=0)
 
