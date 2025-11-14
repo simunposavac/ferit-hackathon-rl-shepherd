@@ -60,6 +60,7 @@ def find_latest_checkpoint(save_dir: str, agent_type: str) -> str | None:
         Path to latest checkpoint or None if not found
     """
     if not os.path.exists(save_dir):
+        print(f"Checkpoint directory does not exist: {save_dir}")
         return None
     
     # Pattern for timestamped folders: YYYY-MM-DD_HH-MM-SS
@@ -67,7 +68,13 @@ def find_latest_checkpoint(save_dir: str, agent_type: str) -> str | None:
     
     # Find all timestamped folders
     timestamped_folders = []
-    for item in os.listdir(save_dir):
+    try:
+        items = os.listdir(save_dir)
+    except OSError:
+        print(f"Cannot read directory: {save_dir}")
+        return None
+    
+    for item in items:
         item_path = os.path.join(save_dir, item)
         if os.path.isdir(item_path):
             match = timestamp_pattern.search(item)
@@ -81,6 +88,28 @@ def find_latest_checkpoint(save_dir: str, agent_type: str) -> str | None:
                     continue
     
     if not timestamped_folders:
+        # Fallback: search all subdirectories for checkpoints
+        print(f"No timestamped folders found in {save_dir}, searching all subdirectories...")
+        all_checkpoints = []
+        for root, dirs, files in os.walk(save_dir):
+            for file in files:
+                if file.startswith(f"{agent_type}_dqn_episode_") and file.endswith(".pth"):
+                    file_path = os.path.join(root, file)
+                    try:
+                        ep_num = int(file.split("_")[-1].replace(".pth", ""))
+                        all_checkpoints.append((file_path, ep_num, os.path.getmtime(file_path)))
+                    except ValueError:
+                        continue
+                elif file == f"{agent_type}_dqn_final.pth":
+                    # Final checkpoint - prefer this
+                    return os.path.join(root, file)
+        
+        if all_checkpoints:
+            # Sort by episode number (highest first), then by modification time
+            all_checkpoints.sort(key=lambda x: (x[1], x[2]), reverse=True)
+            return all_checkpoints[0][0]
+        
+        print(f"No {agent_type} checkpoints found in {save_dir}")
         return None
     
     # Sort by datetime (newest first)
@@ -88,13 +117,20 @@ def find_latest_checkpoint(save_dir: str, agent_type: str) -> str | None:
     
     # Get the latest folder
     latest_folder_path = timestamped_folders[0][0]
+    print(f"Found latest timestamped folder: {latest_folder_path}")
     
     # Now find the latest episode checkpoint in this folder
     final_pattern = f"{agent_type}_dqn_final.pth"
     episode_checkpoints = []
     
     if os.path.exists(latest_folder_path):
-        for file in os.listdir(latest_folder_path):
+        try:
+            files = os.listdir(latest_folder_path)
+        except OSError:
+            print(f"Cannot read folder: {latest_folder_path}")
+            return None
+            
+        for file in files:
             if not file.endswith(".pth"):
                 continue
                 
@@ -102,6 +138,7 @@ def find_latest_checkpoint(save_dir: str, agent_type: str) -> str | None:
             
             if file == final_pattern:
                 # Final checkpoint - prefer this (highest priority)
+                print(f"Found final checkpoint: {file_path}")
                 return file_path
             elif file.startswith(f"{agent_type}_dqn_episode_") and file.endswith(".pth"):
                 # Extract episode number
@@ -114,8 +151,10 @@ def find_latest_checkpoint(save_dir: str, agent_type: str) -> str | None:
     # If no final checkpoint, return the highest episode number
     if episode_checkpoints:
         episode_checkpoints.sort(key=lambda x: x[1], reverse=True)
+        print(f"Found episode checkpoint: {episode_checkpoints[0][0]} (episode {episode_checkpoints[0][1]})")
         return episode_checkpoints[0][0]
     
+    print(f"No {agent_type} checkpoints found in {latest_folder_path}")
     return None
 
 # ============================================================================
