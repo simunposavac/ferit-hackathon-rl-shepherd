@@ -3,13 +3,13 @@
 # ============================================================================
 # Training Checkpoints & Saves (IMPORTANT!)
 # ============================================================================
-saves/
-checkpoints/
-*.pth
-*.pt
-*.ckpt
-*.pkl
-*.pickle
+#saves/
+#checkpoints/
+#*.pth
+#*.pt
+#*.ckpt
+#*.pkl
+#*.pickle
 
 # Logs
 logs/
